@@ -1,0 +1,13 @@
+.DS_Store
+*.bin
+*.safetensors
+*.pt
+*.pth
+__pycache__/
+*.pyc
+modality_taxonomy/.venv/
+modality_taxonomy/modern_vlms/.venv/
+modality_taxonomy/modern_vlms/pretrained/
+modality_taxonomy/data/
+modality_taxonomy/results/
+modality_taxonomy/logs/
