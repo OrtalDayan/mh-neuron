@@ -67,7 +67,7 @@ def parse_args():
     _script_dir = os.path.dirname(os.path.abspath(__file__))              # directory containing this script
     _project_root = os.path.abspath(os.path.join(_script_dir, '..', '..'))  # project root (two levels up)
     p.add_argument('--detail_23k_path',
-                   default=os.path.join(_project_root, 'detail_23k.json'),
+                   default=os.path.join(_script_dir, '..', 'data', 'detail_23k.json'),
                    help='Path to detail_23k.json (defines which images to use)')
     p.add_argument('--coco_img_dir',
                    default='/home/projects/bagon/shared/coco2017/images/train2017/',
@@ -87,7 +87,7 @@ def parse_args():
     # Generation parameters
     p.add_argument('--min_new_tokens', type=int, default=100,
                    help='Min tokens to generate per image')               # forces minimum description length
-    p.add_argument('--max_new_tokens', type=int, default=550,
+    p.add_argument('--max_new_tokens', type=int, default=300,
                    help='Max tokens to generate per image')               # caps maximum description length
     p.add_argument('--device', default='0')                               # CUDA GPU index
 

@@ -1,65 +1,31 @@
-# Generated data
-results/generated_descriptions/shards/
-results/generated_descriptions/*.json
-results/classification*/
-results/taxonomy*/
-results/shards/
+# Results & data
+results/
+results_copy/
+results copy/
+data/
 
 # Logs
 logs/
+
+# Model weights
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Virtual environments
+.venv/
+modern_vlms/.venv/
+modern_vlms/pretrained/
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
 
-# Virtual environment
-.venv/
+# Backup copies
+code_copy/
 
-# HuggingFace cache
-.cache/
-
-# Model weights
-modern_vlms/pretrained/
-
-# Data
-data/
-
-# OS
+# OS / tools
 .DS_Store
-# Virtual environments
-.venv/
-modern_vlms/.venv/
-modern_vlms/pretrained/
-
-# Model weights
-*.bin
-*.safetensors
-*.pt
-*.pth
-
-# Data
-data/
-
-# Results (large outputs)
-results/
-
-# Logs
-logs/
-
-# Python
-__pycache__/
-*.pyc
-.DS_Store
-*.bin
-*.safetensors
-*.pt
-*.pth
-__pycache__/
-*.pyc
-.venv/
-modern_vlms/.venv/
-modern_vlms/pretrained/
-data/
-results/
-logs/
+uv.lock

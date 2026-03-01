@@ -1,0 +1,34 @@
+[project]
+name = "vlm-interprability"
+version = "0.1.0"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "transformers==4.37.2",
+    "tokenizers==0.15.1",
+    "sentencepiece==0.1.99",
+    "accelerate==0.21.0",
+    "torch==2.1.2",
+    "torchvision==0.16.2",
+    "einops==0.6.1",
+    "einops-exts==0.0.4",
+    "timm==0.6.13",
+    "scikit-learn==1.2.2",
+    "peft",
+    "bitsandbytes",
+    "numpy<2",
+    "tqdm",
+    "pillow",
+    "protobuf",
+    "llava",
+    "baukit",
+    "scipy>=1.15.3",
+]
+
+[tool.uv.sources]
+llava = { path = "../LLaVA", editable = true }
+baukit = { git = "https://github.com/davidbau/baukit" }
+
+[tool.uv.workspace]
+exclude = [
+    "modern_vlms",
+]

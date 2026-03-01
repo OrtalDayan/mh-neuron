@@ -205,10 +205,27 @@ def load_neuron_labels(labels_dir, model_type='liuhaotian', n_layers=32,
             fields (pv/pt/pm/pu for xu; p_value/observed_rate_diff
             for permutation).
     """
-    if model_type in ('hf', 'internvl'):
-        prefix = 'model.language_model.layers'                            # HF LLaVA and InternVL both use this path
+    if model_type == 'internvl':
+        prefix = 'language_model.model.layers'                            # InternVL2.5: baukit traces language_model.model.layers
+        suffix = 'feed_forward.act_fn'                                    # InternLM2MLP uses feed_forward, not mlp
+    elif model_type in ('hf',):
+        prefix = 'model.language_model.layers'                            # HF LLaVA uses this path
+        suffix = 'mlp.act_fn'
+    elif model_type == 'llava-ov':
+        # LlavaOnevision _modules tree: ['model'] → ['language_model'] → ['layers']
+        # Baukit path = 'model.language_model.layers', same as llava-hf
+        prefix = 'model.language_model.layers'
+        suffix = 'mlp.act_fn'
+        # Fallback for older runs that used different prefixes
+        test_path = os.path.join(labels_dir, f'{prefix}.0.{suffix}')
+        if not os.path.isdir(test_path):
+            for alt in ['language_model.layers', 'language_model.model.layers', 'model.layers']:
+                if os.path.isdir(os.path.join(labels_dir, f'{alt}.0.{suffix}')):
+                    prefix = alt
+                    break
     else:
         prefix = 'model.layers'                                           # liuhaotian and qwen2vl use this path
+        suffix = 'mlp.act_fn'
 
     # Select label filename based on source method
     if label_source == 'llm_permutation':
@@ -221,7 +238,7 @@ def load_neuron_labels(labels_dir, model_type='liuhaotian', n_layers=32,
     labels_by_layer = {}
     raw_by_layer = {}
     for layer_idx in range(n_layers):
-        layer_name = f'{prefix}.{layer_idx}.mlp.act_fn'
+        layer_name = f'{prefix}.{layer_idx}.{suffix}'
         label_path = os.path.join(labels_dir, layer_name, label_filename)
         if not os.path.isfile(label_path):
             continue
@@ -325,19 +342,12 @@ def extract_down_proj_norms(model, model_type, n_layers=32):
     """
     norms = {}
     for layer_idx in range(n_layers):
-        if model_type in ('hf', 'internvl'):
-            # HF LLaVA: model.language_model.model.layers[i]
-            # InternVL2.5: model.language_model.model.layers[i]  (InternLM2 backbone)
-            layer = model.language_model.model.layers[layer_idx]
-        else:
-            # liuhaotian: model.model.layers[i]
-            # Qwen2.5-VL: model.model.layers[i]  (Qwen2 backbone)
-            layer = model.model.layers[layer_idx]
+        layer = _get_llm_layers(model, model_type)[layer_idx]
 
         # down_proj weight shape: (hidden_size, intermediate_size)
         # Column j = down_proj.weight[:, j] = the vector that neuron j
         # projects into the residual stream
-        W_down = layer.mlp.down_proj.weight.detach().float()
+        W_down = _get_down_proj_weight(layer, model_type).detach().float()
         # L2 norm of each column (dim=0 gives norm over hidden_size)
         col_norms = W_down.norm(dim=0)  # shape: (intermediate_size,)
         norms[layer_idx] = col_norms.cpu()
@@ -411,14 +421,14 @@ def compute_cett_rankings(model, model_type, tokenizer_or_processor,
         n_neurons = len(labels_by_layer[layer_idx])
         act_sum[layer_idx] = np.zeros(n_neurons, dtype=np.float64)
 
-        if model_type in ('hf', 'internvl'):
+        if model_type in ('hf', 'internvl', 'llava-ov'):
             # HF LLaVA and InternVL2.5 both nest the LLM under language_model
-            layer_mod = model.language_model.model.layers[layer_idx]
+            layer_mod = _get_llm_layers(model, model_type)[layer_idx]
         else:
             # liuhaotian and Qwen2.5-VL expose layers directly under model
-            layer_mod = model.model.layers[layer_idx]
+            layer_mod = _get_llm_layers(model, model_type)[layer_idx]
 
-        act_fn = layer_mod.mlp.act_fn
+        act_fn = _get_mlp(layer_mod, model_type).act_fn
 
         # Only record from the first forward pass per image
         # (model.generate calls forward multiple times for each token)
@@ -451,10 +461,7 @@ def compute_cett_rankings(model, model_type, tokenizer_or_processor,
 
         # Reset recording flags for all hooked layers
         for layer_idx in labels_by_layer:
-            if model_type in ('hf', 'internvl'):
-                act_fn = model.language_model.model.layers[layer_idx].mlp.act_fn
-            else:
-                act_fn = model.model.layers[layer_idx].mlp.act_fn
+            act_fn = _get_mlp(_get_llm_layers(model, model_type)[layer_idx], model_type).act_fn
             act_fn._cett_recorded = False
 
         # Prepare inputs and run a single forward pass (1 token is enough)
@@ -487,6 +494,19 @@ def compute_cett_rankings(model, model_type, tokenizer_or_processor,
                     padding=True, return_tensors='pt').to(device)
                 model.generate(**inputs, max_new_tokens=1, do_sample=False)
 
+            elif model_type == 'llava-ov':
+                # LLaVA-OneVision: apply Qwen2 chat template, processor handles image
+                messages = [{"role": "user", "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "Describe this image."},
+                ]}]
+                prompt_text = tokenizer_or_processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True)
+                inputs = tokenizer_or_processor(
+                    images=img, text=prompt_text,
+                    return_tensors='pt').to(device)
+                model.generate(**inputs, max_new_tokens=1, do_sample=False)
+
             else:  # liuhaotian
                 from llava.conversation import conv_templates
                 from llava.constants import IMAGE_TOKEN_INDEX
@@ -516,10 +536,7 @@ def compute_cett_rankings(model, model_type, tokenizer_or_processor,
     for h in hooks:
         h.remove()
     for layer_idx in labels_by_layer:
-        if model_type in ('hf', 'internvl'):
-            act_fn = model.language_model.model.layers[layer_idx].mlp.act_fn
-        else:
-            act_fn = model.model.layers[layer_idx].mlp.act_fn
+        act_fn = _get_mlp(_get_llm_layers(model, model_type)[layer_idx], model_type).act_fn
         if hasattr(act_fn, '_cett_recorded'):
             delattr(act_fn, '_cett_recorded')
 
@@ -604,8 +621,8 @@ def load_model_internvl(model_path, device):
     its training precision.
 
     Internal architecture:
-        model.language_model.model.layers[i].mlp.act_fn
-            → same path as the HF LLaVA backend
+        model.language_model.model.layers[i].feed_forward.act_fn
+            → InternLM2 uses feed_forward (not mlp) and w2 (not down_proj)
 
     Args:
         model_path: local path to the InternVL2.5 checkpoint directory
@@ -665,8 +682,109 @@ def load_model_qwen2vl(model_path, device):
     # Qwen2.5-VL stores its image token id in the processor's tokenizer config
     image_token_id = processor.tokenizer.convert_tokens_to_ids(
         '<|vision_start|>')                                               # placeholder; Qwen handles image tokens via processor
+    _ensure_act_fn_is_module(model, 'qwen2vl')                            # patch act_fn for baukit hookability
 
     return model, processor, None, image_token_id                        # image_processor slot is None (processor covers it)
+
+
+def _ensure_act_fn_is_module(model, model_type):
+    """Ensure every MLP act_fn is an nn.Module so baukit TraceDict can hook it.
+
+    In some transformers versions, Qwen2MLP stores act_fn as a plain function
+    (e.g. torch.nn.functional.silu) rather than an nn.Module (e.g. nn.SiLU()).
+    Baukit's get_module() only traverses nn.Module children, so a plain function
+    is invisible and causes LookupError.  This replaces any non-Module act_fn
+    with nn.SiLU(), which has identical forward behaviour.
+    """
+    if model_type == 'llava-ov':
+        lm = model.language_model
+        layers = lm.model.layers if hasattr(lm, 'model') else lm.layers  # v4.48: .model.layers, v4.52: .layers
+    elif model_type == 'qwen2vl':
+        layers = model.model.layers                                        # Qwen2.5-VL direct
+    else:
+        return                                                             # LLaMA-based models already use nn.SiLU()
+
+    patched = 0
+    for layer in layers:
+        mlp = layer.mlp
+        if not isinstance(mlp.act_fn, torch.nn.Module):                    # plain function → patch it
+            mlp.act_fn = torch.nn.SiLU()                                   # identical to F.silu, but hookable
+            patched += 1
+    if patched:
+        print(f'  Patched {patched} MLP act_fn → nn.SiLU() (baukit hookable)')
+
+
+def _get_llm_layers(model, model_type):
+    """Return the list of LLM transformer layers for any supported model type.
+
+    Handles transformers version differences where LlavaOnevision exposes
+    language_model as Qwen2ForCausalLM (v4.48, has .model.layers) or
+    Qwen2Model (v4.52, has .layers directly).
+    """
+    if model_type in ('hf', 'internvl'):
+        return model.language_model.model.layers
+    elif model_type == 'llava-ov':
+        lm = model.language_model
+        return lm.model.layers if hasattr(lm, 'model') else lm.layers
+    else:  # liuhaotian, qwen2vl
+        return model.model.layers
+
+
+def _get_mlp(layer, model_type):
+    """Return the MLP module from a transformer layer.
+
+    InternLM2 (InternVL backbone) names its MLP 'feed_forward',
+    while all other backends use 'mlp'.
+    """
+    if model_type == 'internvl':
+        return layer.feed_forward                                         # InternLM2DecoderLayer.feed_forward
+    return layer.mlp                                                      # LlamaMLP / Qwen2MLP
+
+
+def _get_down_proj_weight(layer, model_type):
+    """Return the down_proj weight tensor from a transformer layer's MLP.
+
+    InternLM2 names its down-projection 'w2', while all other
+    backends use 'down_proj'.
+    """
+    mlp = _get_mlp(layer, model_type)
+    if model_type == 'internvl':
+        return mlp.w2.weight                                              # InternLM2MLP.w2 = down_proj
+    return mlp.down_proj.weight                                           # LlamaMLP / Qwen2MLP
+
+
+def load_model_llava_ov(model_path, device):
+    """Load LLaVA-OneVision from HuggingFace.
+
+    Architecture: SigLIP vision encoder → 2-layer MLP projector → Qwen2-7B backbone.
+    Uses LlavaOnevisionForConditionalGeneration + AutoProcessor.
+
+    Internal architecture:
+        model.language_model.model.layers[i].mlp.act_fn
+            → Qwen2 SwiGLU MLP, same structure as LLaMA but with Qwen2 backbone
+
+    Args:
+        model_path: HF Hub ID or local path
+        device: torch device string, e.g. 'cuda:0'
+
+    Returns: (model, processor, None, image_token_id)
+        - model:          LlavaOnevisionForConditionalGeneration
+        - processor:      AutoProcessor (text tokenizer + SigLIP image processor)
+        - None:           image_processor slot (processor handles everything)
+        - image_token_id: int — token ID for <image> placeholders
+    """
+    from transformers import LlavaOnevisionForConditionalGeneration, AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(model_path)                  # loads tokenizer + image processor
+    model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,                                        # Qwen2 native dtype
+        low_cpu_mem_usage=True,
+    ).to(device).eval()
+
+    image_token_id = model.config.image_token_index                        # e.g. 151646 for Qwen2 vocab
+    _ensure_act_fn_is_module(model, 'llava-ov')                            # patch act_fn for baukit hookability
+    return model, processor, None, image_token_id
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -727,14 +845,9 @@ def make_ablation_hooks(model, model_type, ablate_indices, n_layers=32,
                 replacement_vals = torch.tensor(vals, dtype=torch.float16)
 
         # Get the act_fn module
-        if model_type in ('hf', 'internvl'):
-            # HF LLaVA and InternVL2.5: LLM nested under language_model
-            layer = model.language_model.model.layers[layer_idx]
-        else:
-            # liuhaotian and Qwen2.5-VL: LLM exposed directly under model
-            layer = model.model.layers[layer_idx]
+        layer = _get_llm_layers(model, model_type)[layer_idx]
 
-        act_fn = layer.mlp.act_fn
+        act_fn = _get_mlp(layer, model_type).act_fn
 
         def hook_fn(module, input, output, _indices=indices_tensor,
                     _method=method, _repl=replacement_vals,
@@ -925,14 +1038,9 @@ def collect_neuron_stats(model, model_type, tokenizer_or_processor,
     hooks = []
 
     for layer_idx in range(n_layers):
-        if model_type in ('hf', 'internvl'):
-            # HF LLaVA and InternVL2.5 both nest LLM under language_model
-            layer = model.language_model.model.layers[layer_idx]
-        else:
-            # liuhaotian and Qwen2.5-VL expose layers directly under model
-            layer = model.model.layers[layer_idx]
+        layer = _get_llm_layers(model, model_type)[layer_idx]
 
-        act_fn = layer.mlp.act_fn
+        act_fn = _get_mlp(layer, model_type).act_fn
 
         # Each accumulator tracks: count, mean, M2, min-heap, max-heap
         acc = {
@@ -1302,6 +1410,27 @@ def generate_answer(model, model_type, tokenizer_or_processor, image_processor,
                 question,                                                 # plain-text question (no <image> prefix needed)
                 generation_config)                                        # returns plain string
 
+        elif model_type == 'llava-ov':
+            # ── LLaVA-OneVision ─────────────────────────────
+            messages = [{"role": "user", "content": [
+                {"type": "image"},                                        # image placeholder
+                {"type": "text", "text": question},
+            ]}]
+            prompt_text = tokenizer_or_processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)     # Qwen2 chat template
+            inputs = tokenizer_or_processor(
+                images=img, text=prompt_text,
+                return_tensors='pt').to(device)                           # processor handles image + text
+
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+            prompt_len = inputs['input_ids'].shape[1]                    # strip the prompt prefix
+            answer = tokenizer_or_processor.decode(
+                output_ids[0][prompt_len:], skip_special_tokens=True)    # decode only new tokens
+
         else:  # qwen2vl
             # ── Qwen2.5-VL ──────────────────────────────────
             from qwen_vl_utils import process_vision_info                 # Qwen helper: extracts image tensors from messages
@@ -1625,11 +1754,12 @@ def parse_args():
     # Model
     p.add_argument('--model_type', default='liuhaotian',
                    choices=['hf', 'liuhaotian', 'llava-hf', 'llava-liuhaotian',
-                            'internvl', 'qwen2vl'],
+                            'internvl', 'qwen2vl', 'llava-ov'],
                    help='"hf" / "llava-hf" for llava-hf/llava-1.5-7b-hf, '
                         '"liuhaotian" / "llava-liuhaotian" for original llava-v1.5-7b, '
                         '"internvl" for InternVL2.5-8B, '
-                        '"qwen2vl" for Qwen2.5-VL-7B-Instruct')
+                        '"qwen2vl" for Qwen2.5-VL-7B-Instruct, '
+                        '"llava-ov" for LLaVA-OneVision-7B')
     p.add_argument('--original_model_path', default='liuhaotian/llava-v1.5-7b')
     p.add_argument('--hf_id', default='llava-hf/llava-1.5-7b-hf')
     p.add_argument('--internvl_path', default='pretrained/InternVL2_5-8B',
@@ -1638,6 +1768,10 @@ def parse_args():
     p.add_argument('--qwen2vl_path', default='pretrained/Qwen2.5-VL-7B-Instruct',
                    help='Local path or HF Hub ID for Qwen2.5-VL model '
                         '(for --model_type qwen2vl)')                     # requires qwen-vl-utils
+    p.add_argument('--llava_ov_path',
+                   default='llava-hf/llava-onevision-qwen2-7b-ov-hf',
+                   help='HF Hub ID or local path for LLaVA-OneVision model '
+                        '(for --model_type llava-ov)')                    # Qwen2 backbone
     p.add_argument('--n_layers', type=int, default=None,
                    help='Number of LLM layers (default: 32 for LLaVA-7B / '
                         'InternVL2.5-8B, 28 for Qwen2.5-VL-7B). '
@@ -1915,8 +2049,15 @@ def main():
         tokenizer_or_processor = tokenizer                                # separate tokenizer and image_processor
     elif args.model_type == 'internvl':
         model, tokenizer, image_processor, image_token_id = load_model_internvl(
-            args.internvl_path, device)
+            args.original_model_path, device)                             # pipeline passes --original_model_path
         tokenizer_or_processor = tokenizer                                # InternVL: use tokenizer; image handled inline
+        # ── Set img_context_token_id (required by InternVL2.5 model.chat()) ──
+        image_token_id = tokenizer.convert_tokens_to_ids('<IMG_CONTEXT>')
+        model.img_context_token_id = image_token_id
+    elif args.model_type == 'llava-ov':
+        model, processor, image_processor, image_token_id = load_model_llava_ov(
+            args.original_model_path, device)
+        tokenizer_or_processor = processor                                # LLaVA-OV: processor handles both modalities
     else:  # qwen2vl
         model, processor, image_processor, image_token_id = load_model_qwen2vl(
             args.qwen2vl_path, device)
@@ -1932,6 +2073,13 @@ def main():
         n_layers = model.config.num_hidden_layers                        # Qwen2.5-VL-7B has 28 layers
     elif args.model_type in ('hf', 'internvl'):
         n_layers = model.language_model.config.num_hidden_layers         # InternVL2.5-8B / HF LLaVA → 32
+    elif args.model_type == 'llava-ov':
+        # Detect n_layers robustly: try language_model.config first, fall back to top-level text_config
+        lm = model.language_model
+        if hasattr(lm.config, 'num_hidden_layers'):
+            n_layers = lm.config.num_hidden_layers                       # works for both v4.48 and v4.52
+        else:
+            n_layers = model.config.text_config.num_hidden_layers        # fallback via top-level config
     else:  # liuhaotian
         n_layers = model.config.num_hidden_layers                        # liuhaotian LLaVA → 32
     print(f'  Using n_layers={n_layers}')
