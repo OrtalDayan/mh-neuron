@@ -42,7 +42,7 @@ def get_layer_names(model_type, n_layers):
         prefix = 'language_model.model.layers'
         suffix = 'feed_forward.act_fn'
     elif model_type == 'qwen2vl':
-        prefix = 'model.layers'
+        prefix = 'model.language_model.layers'
         suffix = 'mlp.act_fn'
     elif model_type == 'llava-ov':
         prefix = 'model.language_model.layers'
@@ -236,8 +236,10 @@ def main():
         generate_plots(out_base_perm, args.model, 'permutation')
 
         # Combined 2×3 grids (all 6 plots in one figure)
-        generate_combined_grid(out_base_llm, args.model, 'th')
-        generate_combined_grid(out_base_perm, args.model, 'pmbt')
+        th_suffix = f'th_{args.model}' if args.model else 'th'
+        pmbt_suffix = f'pmbt_{args.model}' if args.model else 'pmbt'
+        generate_combined_grid(out_base_llm, args.model, th_suffix)
+        generate_combined_grid(out_base_perm, args.model, pmbt_suffix)
 
         # Side-by-side th vs pmbt comparisons
         generate_side_by_side(out_base_llm, out_base_perm,
@@ -344,7 +346,8 @@ def generate_plots(out_base, model_name, method_label):
     title_prefix = f'{model_name} ({method_label})'                  # e.g. llava-1.5-7b (fixed_threshold)
 
     # Short suffix for filenames: "th" for fixed_threshold, "pmbt" for permutation
-    suffix = 'th' if 'fixed' in method_label else 'pmbt'
+    base_suffix = 'th' if 'fixed' in method_label else 'pmbt'          # method tag
+    suffix = f'{base_suffix}_{model_name}' if model_name else base_suffix  # e.g. "th_internvl2.5-8b"
 
     print(f'\n  ── Generating plots → {plot_dir} ──')
 
@@ -882,6 +885,10 @@ def generate_side_by_side(out_base_th, out_base_pmbt,
     import matplotlib.pyplot as plt
     import matplotlib.image as mpimg
 
+    # Build suffixes matching generate_plots
+    th_suffix = f'th_{model_name}' if model_name else 'th'
+    pmbt_suffix = f'pmbt_{model_name}' if model_name else 'pmbt'
+
     plot_dir_th = os.path.join(out_base_th, 'plots')
     plot_dir_pmbt = os.path.join(out_base_pmbt, 'plots')
 
@@ -908,8 +915,8 @@ def generate_side_by_side(out_base_th, out_base_pmbt,
     ]
 
     for base_name, title in plot_types:                              # iterate plot types
-        th_path = os.path.join(plot_dir_th, f'{base_name}_th.png')
-        pmbt_path = os.path.join(plot_dir_pmbt, f'{base_name}_pmbt.png')
+        th_path = os.path.join(plot_dir_th, f'{base_name}_{th_suffix}.png')
+        pmbt_path = os.path.join(plot_dir_pmbt, f'{base_name}_{pmbt_suffix}.png')
 
         if not os.path.isfile(th_path) or not os.path.isfile(pmbt_path):
             continue                                                 # skip if either missing
@@ -930,7 +937,8 @@ def generate_side_by_side(out_base_th, out_base_pmbt,
         ax2.axis('off')
 
         plt.tight_layout()
-        out_path = os.path.join(compare_dir, f'{base_name}_comparison.png')
+        cmp_suffix = f'_{model_name}' if model_name else ''
+        out_path = os.path.join(compare_dir, f'{base_name}_comparison{cmp_suffix}.png')
         fig.savefig(out_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f'    Saved {out_path}')
@@ -939,8 +947,8 @@ def generate_side_by_side(out_base_th, out_base_pmbt,
     # Layout: 6 rows (one per plot type) × 2 columns (th left, pmbt right)
     row_images = []                                                  # [(th_img, pmbt_img, title), ...]
     for base_name, title in plot_types:
-        th_path = os.path.join(plot_dir_th, f'{base_name}_th.png')
-        pmbt_path = os.path.join(plot_dir_pmbt, f'{base_name}_pmbt.png')
+        th_path = os.path.join(plot_dir_th, f'{base_name}_{th_suffix}.png')
+        pmbt_path = os.path.join(plot_dir_pmbt, f'{base_name}_{pmbt_suffix}.png')
         if os.path.isfile(th_path) and os.path.isfile(pmbt_path):
             row_images.append((th_path, pmbt_path, title))
 
@@ -979,7 +987,7 @@ def generate_side_by_side(out_base_th, out_base_pmbt,
                      fontweight='bold', ha='center', va='center',
                      rotation=90, color='#34495e')
 
-        master_path = os.path.join(compare_dir, 'all_comparisons.png')
+        master_path = os.path.join(compare_dir, f'all_comparisons_{model_name}.png')
         fig.savefig(master_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f'    Saved {master_path}')

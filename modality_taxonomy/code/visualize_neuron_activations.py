@@ -83,6 +83,7 @@ Usage:
 """
 
 import argparse
+import io
 import json
 import os
 import textwrap
@@ -359,12 +360,20 @@ def load_act_pattern_layer(act_pattern_dir, layer):
             data['txt_lengths'].astype(np.int32))
 
 
-def load_neuron_labels(data_dir, layer, model_type='llava-hf'):
+def load_neuron_labels(data_dir, layer, model_type='llava-hf',
+                       label_file='neuron_labels.json'):
     """Load neuron classification labels for a layer.
 
     neuron_modality_statistical.py saves per-layer:
         {layer_name}/neuron_labels.json — list of dicts with keys:
             neuron_idx, label, pv, pt, pm, pu, global_max_activation, top_n_valid
+
+    Args:
+        data_dir:    base directory containing layer subdirectories
+        layer:       layer index (int)
+        model_type:  model backend (determines layer directory naming)
+        label_file:  filename to load (default: 'neuron_labels.json',
+                     use 'neuron_labels_permutation.json' for PMBT)
 
     Returns:
         list[dict] — one entry per neuron
@@ -377,11 +386,11 @@ def load_neuron_labels(data_dir, layer, model_type='llava-hf'):
     elif model_type == 'llava-ov':                                   # LLaVA-OneVision (Qwen2 backbone)
         layer_name = f'model.language_model.layers.{layer}.mlp.act_fn'
     elif model_type == 'qwen2vl':                                    # Qwen2.5-VL (Qwen2.5 backbone)
-        layer_name = f'model.layers.{layer}.mlp.act_fn'
+        layer_name = f'model.language_model.layers.{layer}.mlp.act_fn'
     else:                                                           # Original LLaVA naming
         layer_name = f'model.layers.{layer}.mlp.act_fn'
 
-    label_path = os.path.join(data_dir, layer_name, 'neuron_labels.json')
+    label_path = os.path.join(data_dir, layer_name, label_file)
     with open(label_path) as f:
         return json.load(f)
 
@@ -553,10 +562,10 @@ def render_text_with_activations(ax, tokens, activations, max_chars_per_line=90)
     tokens = tokens[:n]
     acts = activations[:n]
 
-    # Layout parameters
-    font_size = 7                                                   # small font to fit many tokens
-    line_height = 0.045                                             # vertical spacing between lines
-    char_width = 0.0075                                             # approximate width per character
+    # Layout parameters — larger font so tokens span more rows
+    font_size = 11                                                  # larger font for readability
+    line_height = 0.075                                             # taller rows to match font size
+    char_width = 0.0115                                             # wider chars to match larger font
     x_margin = 0.02                                                 # left margin
     y_start = 0.97                                                  # start near top
 
@@ -616,11 +625,19 @@ def render_text_with_activations(ax, tokens, activations, max_chars_per_line=90)
 
 def create_neuron_panel(img_array, vis_acts, txt_acts, txt_len,
                         tokens, layer, neuron_idx, label, pv, pt, pm, pu,
-                        patch_grid=24):
+                        patch_grid=24, model_name='',
+                        panel='',
+                        pmbt_label=None,
+                        pmbt_p_vis=None, pmbt_p_txt=None,
+                        pmbt_p_pref=None, pmbt_vis_rate=None, pmbt_txt_rate=None,
+                        viz_taxonomy='both'):
     """Create a single Figure 3-style panel for one neuron + one sample.
 
     Layout:
-        Row 0: header text (neuron type, layer, index, max activations)
+        Row 0: 3-line header
+                 Line 1 — panel label, layer, neuron, max vis/txt activations
+                 Line 2 — FT:   classification label  (pv=..  pt=..  pm=..  pu=..)
+                 Line 3 — PMBT: classification label  (p_vis=.. p_txt=.. [p_pref=..])
         Row 1: [original image] [activation-modulated image]
         Row 2: text tokens with green highlighting
 
@@ -632,58 +649,107 @@ def create_neuron_panel(img_array, vis_acts, txt_acts, txt_len,
         tokens:      list[str] — subword token strings for the description
         layer:       int — layer index
         neuron_idx:  int — neuron index within layer
-        label:       str — 'visual', 'text', 'multimodal', 'unknown'
-        pv, pt, pm, pu: float — classification probabilities
+        label:       str — FT classification: 'visual', 'text', 'multimodal', 'unknown'
+        pv, pt, pm, pu: float — FT classification probabilities
         patch_grid:  int — CLIP patch grid size (24 for LLaVA-1.5)
+        panel:       str — panel label e.g. '(a)'
+        pmbt_label:  str or None — PMBT classification type; omits line 3 when None
+        pmbt_p_vis, pmbt_p_txt: float — PMBT p-values for visual / text
+        pmbt_p_pref: float or None — PMBT preference p-value (if available)
+        pmbt_vis_rate, pmbt_txt_rate: float or None — PMBT activation rates
 
     Returns:
         matplotlib Figure
     """
     # Compute max activation values (normalised 0-10 scale)
-    max_vis_act = int(round(vis_acts.max()))                        # max visual token activation
+    max_vis_act = int(round(vis_acts.max()))
     txt_actual = txt_acts[:txt_len] if txt_len > 0 else np.array([0.0])
-    max_txt_act = int(round(txt_actual.max()))                      # max text token activation
+    max_txt_act = int(round(txt_actual.max()))
 
     # Create activation-modulated image
     mod_img = make_activation_modulated_image(img_array, vis_acts, patch_grid)
 
-    # Pretty label for header
-    label_display = {                                               # formatting for display
-        'visual': 'Visual neuron',
-        'text': 'Text neuron',
+    # Label display map — shared for FT and PMBT lines
+    _label_map = {
+        'visual':     'Visual neuron',
+        'text':       'Text neuron',
         'multimodal': 'Multi-modal neuron',
-        'unknown': 'Unknown neuron',
-    }.get(label, label.capitalize() + ' neuron')
+        'unknown':    'Unknown neuron',
+    }
+    ft_label_display = _label_map.get(label, label.capitalize() + ' neuron')
 
     # ── Build figure ──────────────────────────────────────────
-    fig = plt.figure(figsize=(12, 8))
-    gs = GridSpec(3, 2, figure=fig,                                 # 3 rows, 2 columns
-                  height_ratios=[0.06, 0.54, 0.40],                 # header, images, text
+    header_ratio = 0.14 if pmbt_label is not None else 0.10        # taller header for 3 lines
+    fig = plt.figure(figsize=(12, 10))                             # taller figure for more text rows
+    fig.patch.set_facecolor('white')
+    gs = GridSpec(3, 2, figure=fig,
+                  height_ratios=[header_ratio,
+                                 0.40,                              # images row
+                                 0.60 - header_ratio],              # text row — larger share
                   hspace=0.15, wspace=0.05)
 
-    # Row 0: Header (spans both columns)
+    # Row 0: header spanning both columns
     ax_header = fig.add_subplot(gs[0, :])
+    ax_header.set_facecolor('white')
     ax_header.axis('off')
-    header_text = (
-        f'{label_display}: layer:{layer}, neuron:{neuron_idx}\n'
-        f'Max visual activation:{max_vis_act}, '
-        f'max text activation:{max_txt_act}'
-    )
-    ax_header.text(0.5, 0.5, header_text,                          # centered header
-                   fontsize=13, fontweight='bold',
-                   ha='center', va='center',
+
+    # Line 1: panel | Layer | Neuron | max activations
+    panel_prefix = f'{panel} ' if panel else ''
+    line1 = (f'{panel_prefix}Layer {layer}, Neuron {neuron_idx}'
+             f'  Max vis act: {max_vis_act}, max txt act: {max_txt_act}')
+
+    # Line 2: FT classification + pv/pt/pm/pu probabilities (suppressed for --viz-taxonomy pmbt)
+    show_ft   = viz_taxonomy in ('ft', 'both')
+    show_pmbt = viz_taxonomy in ('pmbt', 'both')
+
+    line2 = (f'FT:   {ft_label_display}'
+             f'  (pv={pv:.4f}, pt={pt:.4f}, pm={pm:.4f}, pu={pu:.4f})')
+
+    # Line 3: PMBT classification + p_value / D
+    if show_pmbt and pmbt_label is not None:
+        pmbt_label_display = _label_map.get(
+            pmbt_label, pmbt_label.capitalize() + ' neuron')
+        p_vis  = pmbt_p_vis  if pmbt_p_vis  is not None else 0.0
+        p_txt  = pmbt_p_txt  if pmbt_p_txt  is not None else 0.0
+        def _fmt(v):
+            if v == 0.0:
+                return '0'
+            elif v >= 0.001:
+                return f'{v:.4f}'                                    # e.g. 0.0123
+            else:
+                return f'{v:.2e}'                                    # e.g. 1.23e-05
+        pmbt_parts = [f'p={_fmt(p_vis)}']
+        if pmbt_p_pref is not None:
+            pmbt_parts.append(f'D={pmbt_p_pref:+.4f}')
+        line3 = f'PMBT: {pmbt_label_display}  ({", ".join(pmbt_parts)})'
+    else:
+        line3 = None
+
+    # Assemble header from whichever lines are enabled
+    lines = [line1]
+    if show_ft:
+        lines.append(line2)
+    if line3:
+        lines.append(line3)
+    header_text = '\n'.join(lines)
+
+    ax_header.text(0.5, 0.5, header_text,
+                   fontsize=13, fontweight='bold', color='black',
+                   ha='center', va='center', family='monospace',
                    transform=ax_header.transAxes)
 
     # Row 1 left: Original image
     ax_orig = fig.add_subplot(gs[1, 0])
+    ax_orig.set_facecolor('white')
     ax_orig.imshow(img_array)
-    ax_orig.set_title('Original image', fontsize=10, pad=4)
+    ax_orig.set_title('Original', fontsize=10, pad=4, color='black')
     ax_orig.axis('off')
 
     # Row 1 right: Activation-modulated image
     ax_mod = fig.add_subplot(gs[1, 1])
+    ax_mod.set_facecolor('white')
     ax_mod.imshow(mod_img)
-    ax_mod.set_title('Activation-modulated image', fontsize=10, pad=4)
+    ax_mod.set_title('Activation', fontsize=10, pad=4, color='black')
     ax_mod.axis('off')
 
     # Row 2: Text with green highlighting (spans both columns)
@@ -698,7 +764,7 @@ def create_neuron_panel(img_array, vis_acts, txt_acts, txt_len,
 # ═══════════════════════════════════════════════════════════════════
 
 def create_two_sample_panel(samples, layer, neuron_idx, label,
-                            explanation='', patch_grid=24):
+                            explanation='', patch_grid=24, model_name=''):
     """Create a Xu Figure 8/9-style panel: two samples for one neuron.
 
     Layout (matching Xu Figures 8, 9, 15-17):
@@ -767,7 +833,8 @@ def create_two_sample_panel(samples, layer, neuron_idx, label,
     # Row 0: Header
     ax_header = fig.add_subplot(outer_gs[0])
     ax_header.axis('off')
-    header_line1 = f'{label_display}: Layer: {layer}, neuron: {neuron_idx}'
+    header_line1 = (f'{label_display}: Layer: {layer}, neuron: {neuron_idx}'
+                    f'{" — " + model_name if model_name else ""}')
     header_line2 = f'Explanation: {explanation}' if explanation else ''
     header_text = header_line1 + ('\n' + header_line2 if header_line2 else '')
     ax_header.text(0.5, 0.5, header_text,
@@ -1009,6 +1076,8 @@ def auto_select_neurons(data_dir, layers, model_type='llava-hf',
 
     prob_key = {'visual': 'pv', 'text': 'pt',                      # map type → probability key
                 'multimodal': 'pm', 'unknown': 'pu'}
+    prob_key_alt = {'visual': 'p_visual', 'text': 'p_text',        # alternative key names
+                    'multimodal': 'p_multimodal', 'unknown': 'p_unknown'}
 
     for layer in layers:
         try:
@@ -1019,17 +1088,18 @@ def auto_select_neurons(data_dir, layers, model_type='llava-hf',
         for entry in labels:
             lbl = entry['label']
             if lbl in target_types:
-                p = entry[prob_key[lbl]]                            # probability for this type
+                p = entry.get(prob_key[lbl],
+                              entry.get(prob_key_alt[lbl], 0.0))    # probability for this type
                 if p > best[lbl]['prob']:
                     best[lbl]['prob'] = p
                     best[lbl]['info'] = {
                         'layer': layer,
                         'neuron_idx': entry['neuron_idx'],
                         'label': lbl,
-                        'pv': entry['pv'],
-                        'pt': entry['pt'],
-                        'pm': entry['pm'],
-                        'pu': entry['pu'],
+                        'pv': entry.get('pv', entry.get('p_visual', 0.0)),
+                        'pt': entry.get('pt', entry.get('p_text', 0.0)),
+                        'pm': entry.get('pm', entry.get('p_multimodal', 0.0)),
+                        'pu': entry.get('pu', entry.get('p_unknown', 0.0)),
                     }
 
     selected = []
@@ -1043,6 +1113,16 @@ def auto_select_neurons(data_dir, layers, model_type='llava-hf',
             print(f'  WARNING: No {t} neuron found')
 
     return selected
+
+
+def _norm_coco_id(coco_id):
+    """Normalise any COCO ID format to a zero-padded 12-char string.
+
+    sampled_ids.json may store IDs as ints (403170), unpadded strings
+    ("403170"), or padded strings ("000000403170"). Normalising both sides
+    guarantees a match regardless of serialisation format.
+    """
+    return str(int(str(coco_id))).zfill(12)
 
 
 def find_rank_for_image(top_n_sids, neuron_idx, sampled_ids, target_coco_id):
@@ -1061,14 +1141,15 @@ def find_rank_for_image(top_n_sids, neuron_idx, sampled_ids, target_coco_id):
     Returns:
         int or None — rank index (0-based) if found, None if image not in top-N
     """
-    sids = top_n_sids[neuron_idx]                                   # (top_n,) sample indices for this neuron
+    target_norm = _norm_coco_id(target_coco_id)                     # normalise once outside loop
+    sids = top_n_sids[neuron_idx]
     for rank_idx in range(len(sids)):
         sid = int(sids[rank_idx])
-        if sid < 0:                                                 # unfilled slot
+        if sid < 0:
             continue
-        if sampled_ids[sid] == target_coco_id:                      # found the target image
+        if _norm_coco_id(sampled_ids[sid]) == target_norm:          # compare normalised IDs
             return rank_idx
-    return None                                                     # image not in this neuron's top-N
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1098,6 +1179,10 @@ def parse_args():
                    help='Model type (determines layer naming + tokenizer)')
     p.add_argument('--hf_id', default='llava-hf/llava-1.5-7b-hf',
                    help='HuggingFace model ID (for tokenizer loading)')
+    p.add_argument('--model_name', default='',
+                   help='Human-readable model name for figure titles and '
+                        'filenames (e.g. "llava-1.5-7b"). If empty, '
+                        'defaults to model_type.')
 
     # Neuron selection
     p.add_argument('--layer', type=int, default=None,
@@ -1112,6 +1197,15 @@ def parse_args():
                    help='Reproduce Xu et al. Figure 3 panels (a)-(f) using '
                         'the exact neurons and COCO images from the paper. '
                         'Requires full pipeline data (all 32 layers).')
+    p.add_argument('--fig3_json', default=None,
+                   help='Path to fig3_neurons.json (output of '
+                        'find_fig3_neurons.py). Overrides hardcoded neuron '
+                        'lists. Default: auto-detect at '
+                        '<data_dir>/../fig3_neurons.json')
+    p.add_argument('--viz-taxonomy', default='both',
+                   choices=['ft', 'pmbt', 'both'],
+                   help='Which taxonomy labels to show in Figure 3 headers '
+                        '(ft | pmbt | both). Default: both')
     p.add_argument('--pmbt_data_dir', default=None,
                    help='Path to PMBT classification data dir (for side-by-side '
                         'FT vs PMBT figures). If provided, generates both FT '
@@ -1159,6 +1253,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # ── Resolve model_name (used in filenames + figure titles) ─
+    if not args.model_name:
+        args.model_name = args.model_type
 
     # ── Resolve directories ───────────────────────────────────
     topn_heap_dir = os.path.join(args.data_dir, 'topn_heap')              # Top-N Heap saved here
@@ -1216,14 +1314,37 @@ def main():
     # ── Determine which neurons to visualize ──────────────────
     if args.fig3:
         # ── Fig3 mode: reproduce exact panels from Xu et al. ──
-        # Select per-model neuron table
-        fig3_neurons = FIG3_NEURONS_BY_MODEL.get(args.model_type, [])
+        # Priority: --fig3_json → auto-detect JSON → hardcoded list
+        fig3_neurons = None
+
+        # 1. Explicit --fig3_json path
+        json_path = args.fig3_json
+
+        # 2. Auto-detect at <data_dir>/../fig3_neurons.json
+        if json_path is None:
+            auto_path = os.path.join(
+                os.path.dirname(args.data_dir.rstrip('/')),
+                'fig3_neurons.json')
+            if os.path.isfile(auto_path):
+                json_path = auto_path
+
+        # 3. Load from JSON if found
+        if json_path and os.path.isfile(json_path):
+            print(f'\n  Loading fig3 neurons from {json_path}')
+            with open(json_path) as f:
+                fig3_neurons = json.load(f)
+            print(f'  Loaded {len(fig3_neurons)} panel entries')
+
+        # 4. Fallback to hardcoded list
+        if not fig3_neurons:
+            fig3_neurons = FIG3_NEURONS_BY_MODEL.get(args.model_type, [])
+
         if not fig3_neurons:
             print(f'\nNo Figure 3 neurons defined for '
                   f'model_type={args.model_type}.')
-            print(f'Update the corresponding FIG3_NEURONS_* list in '
-                  'visualize_neuron_activations.py once neurons '
-                  'are identified.')
+            print(f'Run find_fig3_neurons.py first:')
+            print(f'  bash code/run_pipeline.sh --model-type '
+                  f'{args.model_type} --step find_fig3 --local')
             return
 
         print('\n' + '═'*60)
@@ -1235,16 +1356,23 @@ def main():
         print(f'  Required layers: {required_layers}')
         print(f'  Panels: {len(fig3_neurons)}')
 
-        has_pmbt = (args.pmbt_data_dir is not None
-                    and os.path.isdir(args.pmbt_data_dir))
+        # has_pmbt = True whenever a PMBT dir is supplied (even if it doesn't
+        # exist yet); the pre-fetch block below falls back to data_dir so that
+        # neuron_labels_permutation.json is found wherever it was written.
+        has_pmbt = args.pmbt_data_dir is not None
         if has_pmbt:
-            print(f'  PMBT data dir: {args.pmbt_data_dir}')
-            print(f'  Will generate FT + PMBT + comparison figures')
+            _pmbt_dir_ok = os.path.isdir(args.pmbt_data_dir)
+            print(f'  PMBT data dir: {args.pmbt_data_dir} '
+                  f'({"exists" if _pmbt_dir_ok else "not found — will try data_dir fallback"})')
         else:
-            print(f'  PMBT data dir: not provided — FT figures only')
+            print(f'  PMBT disabled — --pmbt_data_dir not set')
 
         ft_panel_paths = []                                             # collect FT panel paths
         pmbt_panel_paths = []                                           # collect PMBT panel paths
+
+        # Tracks rank slots already used per (layer, nidx) to prevent
+        # panels sharing a neuron (e.g. (e)/(f)) from using the same rank.
+        used_rank_by_neuron = {}                                        # (layer, nidx) -> set[int]
 
         for entry in fig3_neurons:
             layer = entry['layer']
@@ -1258,76 +1386,83 @@ def main():
             print(f'  layer={layer}, neuron={nidx}, '
                   f'target image={target_coco_id}')
 
-            # Load Top-N Heap data for this layer
-            try:
-                top_n_sids, top_n_acts, global_max = load_topn_heap_layer(
-                    topn_heap_dir, layer)
-            except FileNotFoundError:
-                print(f'  ERROR: Top-N Heap data not found for layer {layer}. '
-                      f'Run full pipeline (all 32 layers) first.')
+            # ── Load image directly from the known target COCO ID ────────
+            # The 6 fig3 image IDs are hardcoded in fig3_neurons — there is
+            # no need to search the Top-N Heap to find the image. The heap
+            # is only consulted to find which rank slot holds the activations
+            # for this specific image (test mode: always rank 0).
+            img_id = target_coco_id                                 # always use the exact fig3 image
+            filename = (id_to_fn.get(img_id)                        # try padded ID first
+                        or id_to_fn.get(str(int(img_id))))           # then unpadded fallback
+            if filename:
+                img_path = os.path.join(args.coco_img_dir, filename)
+            else:
+                img_path = os.path.join(args.coco_img_dir,
+                                        f'{img_id}.jpg')            # direct filename fallback
+            if not os.path.exists(img_path):
+                print(f'  ERROR: Image not found: {img_path}, skipping')
                 continue
+            print(f'  Image: {img_path}')
 
-            # Load Activation Pattern raw activations for this layer
+            # ── Find rank slot for activations ──────────────────────────
+            # Try to locate the image in the Top-N Heap to read its
+            # saved activation pattern. In test / patch-only mode the
+            # heap is absent and patch_fig3_activations.py has already
+            # written activations to rank slot 0 of act_pattern_raw.
+            try:
+                top_n_sids, top_n_acts, _ = load_topn_heap_layer(
+                    topn_heap_dir, layer)
+                rank_idx = find_rank_for_image(
+                    top_n_sids, nidx, sampled_ids, target_coco_id)
+                if rank_idx is None:
+                    # Image not in heap — pick highest unused rank
+                    already_used = used_rank_by_neuron.get((layer, nidx), set())
+                    for candidate in np.argsort(-top_n_acts[nidx]):
+                        if int(candidate) not in already_used:
+                            rank_idx = int(candidate)
+                            break
+                    if rank_idx is None:
+                        print(f'  ERROR: No unused rank for neuron {nidx}, skipping')
+                        continue
+                    print(f'  WARNING: {target_coco_id} not in heap, '
+                          f'using rank {rank_idx} for activations.')
+                else:
+                    print(f'  Activations at rank {rank_idx}')
+                used_rank_by_neuron.setdefault((layer, nidx), set()).add(rank_idx)
+            except FileNotFoundError:
+                # Test / patch-only mode: no heap — patch always writes to rank 0
+                rank_idx = 0
+                print(f'  [test mode] No heap — using act_pattern rank 0')
+
+            # ── Load activation pattern ──────────────────────────────────
             try:
                 vis_acts_all, txt_acts_all, txt_len_all = load_act_pattern_layer(
                     act_pattern_dir, layer)
             except FileNotFoundError:
-                print(f'  ERROR: Activation Pattern data not found for layer {layer}. '
-                      f'Run full pipeline (all 32 layers) first.')
+                print(f'  ERROR: Activation Pattern missing for layer {layer}.')
+                print(f'  Run patch_fig3_activations.py first (done by step 6).')
                 continue
 
-            # Find the rank corresponding to the target COCO image
-            rank_idx = find_rank_for_image(
-                top_n_sids, nidx, sampled_ids, target_coco_id)
-
-            if rank_idx is not None:
-                print(f'  Found target image at rank {rank_idx}')
-            else:
-                # Image not in this neuron's top-N — fall back to top-1
-                print(f'  WARNING: Image {target_coco_id} not in neuron\'s '
-                      f'top-N. Falling back to rank 0 (top-1 sample).')
-                sorted_ranks = np.argsort(-top_n_acts[nidx])
-                rank_idx = sorted_ranks[0]
-
-            sample_idx = int(top_n_sids[nidx, rank_idx])
-            if sample_idx < 0:
-                print(f'  ERROR: Invalid sample at rank {rank_idx}, skipping')
-                continue
-
-            img_id = sampled_ids[sample_idx]
-            filename = id_to_fn.get(img_id)
-            if filename is None:
-                print(f'  ERROR: No filename for image {img_id}, skipping')
-                continue
-
-            img_path = os.path.join(args.coco_img_dir, filename)
-            if not os.path.exists(img_path):
-                print(f'  ERROR: Image not found: {img_path}, skipping')
-                continue
-
-            print(f'  Using: sample_idx={sample_idx}, image={img_id}, '
-                  f'file={filename}')
-
-            # Load image
+            # Load image array
             img = Image.open(img_path).convert('RGB')
             img_array = np.array(img)
 
-            # Extract activations (shared between FT and PMBT)
-            vis_acts = vis_acts_all[nidx, rank_idx, :]
-            txt_acts = txt_acts_all[nidx, rank_idx, :]
-            txt_len = int(txt_len_all[nidx, rank_idx])
+            # Extract activations for this neuron at the located rank slot
+            vis_acts = vis_acts_all[nidx, rank_idx, :]                 # (576,) visual activations
+            txt_acts = txt_acts_all[nidx, rank_idx, :]                 # (MAX_TXT,) text activations
+            txt_len  = int(txt_len_all[nidx, rank_idx])                # actual token count
 
-            # Get text tokens
-            if img_id in descriptions:
+            # Get text tokens — try padded then unpadded key
+            desc_key = img_id if img_id in descriptions else str(int(img_id))
+            if desc_key in descriptions:
                 tokens = get_description_tokens(
-                    tokenizer, img_id, descriptions, args.model_type)
+                    tokenizer, desc_key, descriptions, args.model_type)
                 if len(tokens) != txt_len and txt_len > 0:
                     print(f'  NOTE: token count mismatch: '
                           f'tokenizer={len(tokens)}, saved={txt_len}')
             else:
-                tokens = [f'tok_{i}' for i in range(txt_len)]
-                print(f'  WARNING: No description for {img_id}, '
-                      f'using placeholders')
+                tokens = [f'tok_{i}' for i in range(max(txt_len, 1))]
+                print(f'  WARNING: No description for {img_id}, using placeholders')
 
             print(f'  Visual acts: max={vis_acts.max():.1f}, '
                   f'mean={vis_acts.mean():.2f}')
@@ -1340,16 +1475,73 @@ def main():
             base_name = (f'fig3_{panel_tag}_{label}_layer{layer}'
                          f'_neuron{nidx}_{args.model_type}')
 
+            # ── Pre-fetch PMBT label + p-values for title line 3 ────────
+            # Reads statistical test p-values (p_vis, p_txt, vis_rate,
+            # txt_rate) — distinct from FT probability values (pv, pt, etc.)
+            pmbt_label_val   = None
+            pmbt_p_vis_val   = pmbt_p_txt_val  = None
+            pmbt_p_pref_val  = None
+            pmbt_vis_rate_val = pmbt_txt_rate_val = None
+            if has_pmbt:
+                try:
+                    # Search order: pmbt_data_dir (permutation file) →
+                    #               pmbt_data_dir (default file) →
+                    #               data_dir      (permutation file) ← fallback when
+                    #               data_dir      (default file)        llm_permutation dir absent
+                    _search = [
+                        (args.pmbt_data_dir, 'neuron_labels_permutation.json'),
+                        (args.pmbt_data_dir, 'neuron_labels.json'),
+                        (args.data_dir,      'neuron_labels_permutation.json'),
+                        (args.data_dir,      'neuron_labels.json'),
+                    ]
+                    _pmbt_pre = None
+                    for _sdir, _sfn in _search:
+                        try:
+                            _pmbt_pre = load_neuron_labels(
+                                _sdir, layer, args.model_type,
+                                label_file=_sfn)
+                            print(f'  PMBT labels loaded from {_sdir}/{_sfn}')
+                            break                                   # stop at first success
+                        except FileNotFoundError:
+                            continue
+                    if _pmbt_pre is None:
+                        raise FileNotFoundError('No PMBT label file found in any search path')
+                    _pi = _pmbt_pre[nidx]
+                    pmbt_label_val  = _pi.get('label', label)      # PMBT classification label
+                    pmbt_p_vis_val  = _pi.get('p_value', 1.0)      # permutation test p-value
+                    pmbt_p_pref_val = _pi.get('observed_rate_diff', 0.0)  # D = rate_vis - rate_txt
+                except (FileNotFoundError, IndexError, KeyError, TypeError) as e:
+                    print(f'  WARNING: PMBT pre-fetch failed: {e}')
+                    pmbt_label_val = None
+
             # ── FT panel ──
             try:
                 ft_labels = load_neuron_labels(
                     args.data_dir, layer, args.model_type)
                 ft_info = ft_labels[nidx]
-                ft_pv, ft_pt = ft_info['pv'], ft_info['pt']
-                ft_pm, ft_pu = ft_info['pm'], ft_info['pu']
-            except (FileNotFoundError, IndexError):
-                ft_pv = ft_pt = ft_pm = ft_pu = 0.0
-                print(f'  WARNING: No FT labels for layer {layer}')
+                label = ft_info.get('label', label)               # use live label from JSON, not hardcoded
+                ft_pv = ft_info.get('pv', ft_info.get('p_visual', 0.0))
+                ft_pt = ft_info.get('pt', ft_info.get('p_text', 0.0))
+                ft_pm = ft_info.get('pm', ft_info.get('p_multimodal', 0.0))
+                ft_pu = ft_info.get('pu', ft_info.get('p_unknown', 0.0))
+            except (FileNotFoundError, IndexError, KeyError, TypeError):
+                # Fall back to full-mode FT labels when test dir has none
+                _ft_full_dir = os.path.join(
+                    'results', '3-classify', 'full',
+                    args.model_name, 'llm_fixed_threshold')
+                try:
+                    ft_labels = load_neuron_labels(
+                        _ft_full_dir, layer, args.model_type)
+                    ft_info = ft_labels[nidx]
+                    label = ft_info.get('label', label)
+                    ft_pv = ft_info.get('pv', ft_info.get('p_visual', 0.0))
+                    ft_pt = ft_info.get('pt', ft_info.get('p_text', 0.0))
+                    ft_pm = ft_info.get('pm', ft_info.get('p_multimodal', 0.0))
+                    ft_pu = ft_info.get('pu', ft_info.get('p_unknown', 0.0))
+                    print(f'  FT labels loaded from full dir: {_ft_full_dir}')
+                except (FileNotFoundError, IndexError, KeyError, TypeError):
+                    ft_pv = ft_pt = ft_pm = ft_pu = 0.0
+                    print(f'  WARNING: No FT labels for layer {layer}')
 
             fig_ft = create_neuron_panel(
                 img_array=img_array, vis_acts=vis_acts,
@@ -1357,73 +1549,55 @@ def main():
                 layer=layer, neuron_idx=nidx, label=label,
                 pv=ft_pv, pt=ft_pt, pm=ft_pm, pu=ft_pu,
                 patch_grid=args.patch_grid,
+                model_name=args.model_name,
+                panel=panel,                                        # e.g. '(a)'
+                pmbt_label=pmbt_label_val,                          # PMBT classification for line 3
+                pmbt_p_vis=pmbt_p_vis_val,                          # p_value
+                pmbt_p_pref=pmbt_p_pref_val,                        # D = rate_vis - rate_txt
+                viz_taxonomy=getattr(args, 'viz_taxonomy', 'both'), # controls which lines show
             )
-            ft_path = os.path.join(
-                args.output_dir, f'{base_name}_ft.{args.format}')
-            fig_ft.savefig(ft_path, dpi=args.dpi,
-                           bbox_inches='tight', facecolor='white')
-            plt.close(fig_ft)
-            ft_panel_paths.append(ft_path)
-            print(f'  Saved FT:   {ft_path}')
+            # Store figure object directly — no disk write per panel
+            ft_panel_paths.append(fig_ft)                          # list of Figure objects
+            print(f'  Rendered FT panel {panel}')
 
-            # ── PMBT panel (if available) ──
-            if has_pmbt:
-                try:
-                    pmbt_labels = load_neuron_labels(
-                        args.pmbt_data_dir, layer, args.model_type)
-                    pmbt_info = pmbt_labels[nidx]
-                    pmbt_pv, pmbt_pt = pmbt_info['pv'], pmbt_info['pt']
-                    pmbt_pm, pmbt_pu = pmbt_info['pm'], pmbt_info['pu']
-                    pmbt_label = pmbt_info.get('label', label)
-                except (FileNotFoundError, IndexError):
-                    pmbt_pv = pmbt_pt = pmbt_pm = pmbt_pu = 0.0
-                    pmbt_label = label
-                    print(f'  WARNING: No PMBT labels for layer {layer}')
-
-                fig_pmbt = create_neuron_panel(
-                    img_array=img_array, vis_acts=vis_acts,
-                    txt_acts=txt_acts, txt_len=txt_len, tokens=tokens,
-                    layer=layer, neuron_idx=nidx, label=pmbt_label,
-                    pv=pmbt_pv, pt=pmbt_pt, pm=pmbt_pm, pu=pmbt_pu,
-                    patch_grid=args.patch_grid,
-                )
-                pmbt_path = os.path.join(
-                    args.output_dir, f'{base_name}_pmbt.{args.format}')
-                fig_pmbt.savefig(pmbt_path, dpi=args.dpi,
-                                 bbox_inches='tight', facecolor='white')
-                plt.close(fig_pmbt)
-                pmbt_panel_paths.append(pmbt_path)
-                print(f'  Saved PMBT: {pmbt_path}')
 
         # ── Create combined figures ──
-        def _make_combined_grid(paths, entries, suffix, title_extra=''):
-            """Build a 2×3 grid from 6 panel image paths."""
-            if len(paths) != 6:
-                print(f'\n  WARNING: Only {len(paths)}/6 {suffix} panels, '
+        def _make_combined_grid(figs, entries, suffix, title_extra=''):
+            """Build a 2×3 grid directly from 6 Figure objects (no disk I/O)."""
+            if len(figs) != 6:
+                print(f'\n  WARNING: Only {len(figs)}/6 {suffix} panels, '
                       f'skipping combined {suffix} figure.')
                 return None
             print(f'\n{"─"*60}')
             print(f'Creating combined {suffix.upper()} figure (2×3)...')
             fig_c, axes_c = plt.subplots(2, 3, figsize=(36, 20))
-            for ax, path, entry in zip(axes_c.flatten(), paths, entries):
-                ax.imshow(np.array(Image.open(path)))
-                ax.set_title(
-                    f'{entry["panel"]} {entry["description"]}{title_extra}',
-                    fontsize=14, fontweight='bold')
+            fig_c.patch.set_facecolor('white')
+            for ax, panel_fig in zip(axes_c.flatten(), figs):
+                # Render each Figure to an in-memory buffer and read as array
+                buf = io.BytesIO()                                  # in-memory buffer, no disk write
+                panel_fig.savefig(buf, format='png', dpi=args.dpi,
+                                  bbox_inches='tight', facecolor='white')
+                plt.close(panel_fig)                               # free memory immediately
+                buf.seek(0)                                        # rewind before reading
+                ax.set_facecolor('white')
+                ax.imshow(np.array(Image.open(buf).convert('RGB')))
                 ax.axis('off')
-            fig_c.tight_layout(pad=2.0)
+            fig_c.tight_layout(pad=2.5)
             cpath = os.path.join(
                 args.output_dir,
-                f'fig3_combined_{args.model_type}_{suffix}.{args.format}')
+                f'fig3_combined_{args.model_name}_{suffix}.{args.format}')
             fig_c.savefig(cpath, dpi=args.dpi,
                           bbox_inches='tight', facecolor='white')
             plt.close(fig_c)
             print(f'  Saved: {cpath}')
             return cpath
 
-        _make_combined_grid(ft_panel_paths, fig3_neurons, 'ft')
+        # The FT panels already embed both FT and PMBT info in their
+        # 3-line title — one combined grid is sufficient.
+        _tax_suffix = getattr(args, 'viz_taxonomy', 'ft')              # ft | pmbt | both
+        _make_combined_grid(ft_panel_paths, fig3_neurons, _tax_suffix)
 
-        if has_pmbt:
+        if False:  # PMBT-only grid disabled — info already in FT panel titles
             _make_combined_grid(pmbt_panel_paths, fig3_neurons, 'llm_pmbt')
 
             # ── Side-by-side comparison: PMBT (left) | FT (right) ──
@@ -1432,6 +1606,8 @@ def main():
                 print('Creating comparison figure (PMBT left | FT right)...')
                 fig_cmp, axes_cmp = plt.subplots(
                     2, 6, figsize=(60, 20))                            # 2 rows × 6 cols
+                fig_cmp.suptitle(f'Figure 3 Comparison — {args.model_name}',
+                                 fontsize=18, fontweight='bold', y=1.02)
 
                 for i, entry in enumerate(fig3_neurons):
                     row = i // 3                                       # 0 or 1
@@ -1456,7 +1632,7 @@ def main():
                 fig_cmp.tight_layout(pad=1.5)
                 cmp_path = os.path.join(
                     args.output_dir,
-                    f'fig3_combined_{args.model_type}_comparison.{args.format}')
+                    f'fig3_combined_{args.model_name}_comparison.{args.format}')
                 fig_cmp.savefig(cmp_path, dpi=args.dpi,
                                 bbox_inches='tight', facecolor='white')
                 plt.close(fig_cmp)
@@ -1522,9 +1698,10 @@ def main():
                 label=label,
                 explanation=explanation,
                 patch_grid=args.patch_grid,
+                model_name=args.model_name,
             )
 
-            out_name = f'{fig_tag}_{label}_layer{layer}_neuron{nidx}.{args.format}'
+            out_name = f'{fig_tag}_{label}_layer{layer}_neuron{nidx}_{args.model_name}.{args.format}'
             out_path = os.path.join(args.output_dir, out_name)
             fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight',
                         facecolor='white')
@@ -1545,8 +1722,10 @@ def main():
             'layer': args.layer,
             'neuron_idx': args.neuron_idx,
             'label': entry['label'],
-            'pv': entry['pv'], 'pt': entry['pt'],
-            'pm': entry['pm'], 'pu': entry['pu'],
+            'pv': entry.get('pv', entry.get('p_visual', 0.0)),
+            'pt': entry.get('pt', entry.get('p_text', 0.0)),
+            'pm': entry.get('pm', entry.get('p_multimodal', 0.0)),
+            'pu': entry.get('pu', entry.get('p_unknown', 0.0)),
         }]
         print(f'\nVisualizing specific neuron: layer={args.layer}, '
               f'idx={args.neuron_idx}, type={entry["label"]}')
@@ -1596,10 +1775,11 @@ def main():
                 label=label,
                 explanation='',
                 patch_grid=args.patch_grid,
+                model_name=args.model_name,
             )
 
             out_name = (f'{label}_layer{layer}_neuron{nidx}'
-                        f'_2samples.{args.format}')
+                        f'_2samples_{args.model_name}.{args.format}')
             out_path = os.path.join(args.output_dir, out_name)
             fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight',
                         facecolor='white')
@@ -1677,13 +1857,16 @@ def main():
             layer=layer,
             neuron_idx=nidx,
             label=label,
-            pv=info['pv'], pt=info['pt'],
-            pm=info['pm'], pu=info['pu'],
+            pv=info.get('pv', info.get('p_visual', 0.0)),
+            pt=info.get('pt', info.get('p_text', 0.0)),
+            pm=info.get('pm', info.get('p_multimodal', 0.0)),
+            pu=info.get('pu', info.get('p_unknown', 0.0)),
             patch_grid=args.patch_grid,
+            model_name=args.model_name,
         )
 
         # Save
-        out_name = f'{label}_layer{layer}_neuron{nidx}_rank{rank}.{args.format}'
+        out_name = f'{label}_layer{layer}_neuron{nidx}_rank{rank}_{args.model_name}.{args.format}'
         out_path = os.path.join(args.output_dir, out_name)
         fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight',
                     facecolor='white')

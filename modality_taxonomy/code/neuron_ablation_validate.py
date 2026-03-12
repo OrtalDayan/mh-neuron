@@ -51,6 +51,13 @@ Implements 7 ablation approaches:
      ordering within each group. Ablating higher-CETT neurons
      first causes more disruption per neuron removed.
 
+  9. Combined ranking (--ranking_method combined)
+     Ranks neurons by confidence × normalized_cett. This prioritizes
+     neurons that are both strongly typed (high classification
+     confidence) and functionally impactful (high CETT). CETT
+     scores are min-max normalized globally to [0, 1] before
+     multiplying with confidence.
+
 Conditions:
   baseline     — no ablation (original model)
   ablate_text  — ablate text-classified neurons
@@ -88,6 +95,7 @@ import json
 import glob
 import os
 import re
+import shutil
 import string
 import sys
 import time
@@ -181,7 +189,7 @@ def _internvl_preprocess_image(img, max_num=12):
     ])
     patches      = _internvl_dynamic_preprocess(img, max_num=max_num)    # list of PIL patches
     pixel_values = torch.stack([transform(p) for p in patches])          # (n_patches, 3, 448, 448) float32
-    return pixel_values.half()                                            # cast to float16 for model inference
+    return pixel_values.to(torch.bfloat16)                                 # cast to bfloat16 to match model precision
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -223,8 +231,11 @@ def load_neuron_labels(labels_dir, model_type='liuhaotian', n_layers=32,
                 if os.path.isdir(os.path.join(labels_dir, f'{alt}.0.{suffix}')):
                     prefix = alt
                     break
+    elif model_type == 'qwen2vl':
+        prefix = 'model.language_model.layers'                            # Qwen2.5-VL: model → language_model → layers
+        suffix = 'mlp.act_fn'
     else:
-        prefix = 'model.layers'                                           # liuhaotian and qwen2vl use this path
+        prefix = 'model.layers'                                           # liuhaotian uses this path
         suffix = 'mlp.act_fn'
 
     # Select label filename based on source method
@@ -313,6 +324,55 @@ def get_ranked_neurons_by_type(raw_by_layer, label_source='llm_permutation'):
         ranked[label].sort(key=lambda x: x[2], reverse=True)
 
     return ranked
+
+
+def rerank_by_halluc_scores(ranked_neurons, halluc_scores_path):
+    """Re-rank neurons within each modality type by hallucination scores.
+
+    Loads per-neuron hallucination scores (ΔH, CETT-diff, or combined)
+    from step 10 and replaces the classification-confidence scores in
+    ranked_neurons with halluc scores. Neurons without a halluc score
+    are placed at the bottom with score 0.
+
+    Args:
+        ranked_neurons: dict {label: [(layer_idx, neuron_idx, conf_score)]}
+            Output of get_ranked_neurons_by_type(), sorted by confidence.
+        halluc_scores_path: str — path to JSON file with format
+            {"layer_neuron": score, ...} e.g. {"5_1234": 0.00312}
+
+    Returns:
+        reranked: dict {label: [(layer_idx, neuron_idx, halluc_score)]}
+            Same format, re-sorted descending by hallucination score.
+    """
+    with open(halluc_scores_path) as f:                                    # Line 1: load halluc scores JSON
+        raw = json.load(f)
+
+    # Parse "layer_neuron" keys into (layer, neuron) → score
+    halluc = {}                                                            # Line 2: {(layer, neuron): float}
+    for key_str, val in raw.items():                                       # Line 3: iterate serialized keys
+        parts = key_str.split('_')                                         # Line 4: e.g. "5_1234" → ["5", "1234"]
+        halluc[(int(parts[0]), int(parts[1]))] = float(val)                # Line 5: store as tuple key
+
+    print(f'  Loaded {len(halluc)} hallucination scores from {halluc_scores_path}')
+
+    # Re-rank each category by halluc score
+    reranked = {}                                                          # Line 6: output dict
+    for label, entries in ranked_neurons.items():                          # Line 7: iterate categories
+        rescored = []                                                      # Line 8: new list with halluc scores
+        for layer_idx, neuron_idx, _ in entries:                           # Line 9: discard old confidence score
+            h_score = halluc.get((layer_idx, neuron_idx), 0.0)             # Line 10: lookup halluc score, default 0
+            rescored.append((layer_idx, neuron_idx, h_score))              # Line 11: store with new score
+        rescored.sort(key=lambda x: x[2], reverse=True)                    # Line 12: sort descending by halluc score
+        reranked[label] = rescored                                         # Line 13: assign to output
+
+        # Print summary for this category
+        n_scored = sum(1 for _, _, s in rescored if s != 0.0)              # Line 14: count neurons with actual scores
+        if rescored:
+            top_s = rescored[0][2]                                         # Line 15: highest halluc score
+            print(f'    {label:12s}: {n_scored}/{len(rescored)} have halluc '
+                  f'scores, top={top_s:.6f}')
+
+    return reranked                                                        # Line 16: same format, new ranking
 
 
 def extract_down_proj_norms(model, model_type, n_layers=32):
@@ -700,7 +760,7 @@ def _ensure_act_fn_is_module(model, model_type):
         lm = model.language_model
         layers = lm.model.layers if hasattr(lm, 'model') else lm.layers  # v4.48: .model.layers, v4.52: .layers
     elif model_type == 'qwen2vl':
-        layers = model.model.layers                                        # Qwen2.5-VL direct
+        layers = model.model.language_model.layers                           # Qwen2.5-VL: model → visual + language_model
     else:
         return                                                             # LLaMA-based models already use nn.SiLU()
 
@@ -726,7 +786,9 @@ def _get_llm_layers(model, model_type):
     elif model_type == 'llava-ov':
         lm = model.language_model
         return lm.model.layers if hasattr(lm, 'model') else lm.layers
-    else:  # liuhaotian, qwen2vl
+    elif model_type == 'qwen2vl':
+        return model.model.language_model.layers
+    else:  # liuhaotian
         return model.model.layers
 
 
@@ -751,6 +813,148 @@ def _get_down_proj_weight(layer, model_type):
     if model_type == 'internvl':
         return mlp.w2.weight                                              # InternLM2MLP.w2 = down_proj
     return mlp.down_proj.weight                                           # LlamaMLP / Qwen2MLP
+
+
+def get_encoder_mlp_modules(model, model_type, last_n=None):
+    """Return the MLP modules from the vision encoder layers.
+
+    Each VLM architecture stores its vision encoder differently:
+      - LLaVA-OV (SigLIP):   model.vision_tower.vision_model.encoder.layers[i].mlp
+      - Qwen2.5-VL:          model.visual.blocks[i].mlp
+      - InternVL (InternViT): model.vision_model.encoder.layers[i].mlp
+
+    Used as a control condition: if suppressing the entire encoder
+    reduces hallucination less than suppressing visual LLM neurons,
+    then the hallucination originates in how the LLM processes
+    visual features, not in the visual features themselves.
+
+    Args:
+        model: loaded VLM model
+        model_type: backend string ('llava-ov', 'qwen2vl', 'internvl', 'hf')
+        last_n: number of encoder layers to include from the end.
+                None means all layers (default for strongest control).
+
+    Returns:
+        modules: list of nn.Module — MLP modules from selected encoder layers
+        total_neurons: int — approximate number of MLP neurons across those layers
+        n_layers_total: int — total number of encoder layers in model
+    """
+    if model_type == 'llava-ov':                                           # Line 1: SigLIP ViT encoder
+        enc_layers = model.vision_tower.vision_model.encoder.layers
+    elif model_type == 'qwen2vl':                                          # Line 2: Qwen2.5-VL uses .visual.blocks
+        enc_layers = model.visual.blocks
+    elif model_type == 'internvl':                                         # Line 3: InternViT encoder
+        enc_layers = model.vision_model.encoder.layers
+    elif model_type == 'hf':                                               # Line 4: HF LLaVA (CLIP-ViT)
+        enc_layers = model.vision_tower.vision_model.encoder.layers
+    else:                                                                  # Line 5: liuhaotian LLaVA
+        enc_layers = model.model.vision_tower.vision_tower.vision_model.encoder.layers
+
+    n_total = len(enc_layers)                                              # Line 6: total encoder layers
+    if last_n is not None and last_n < n_total:                            # Line 7: optionally select last N
+        start = n_total - last_n
+        selected = enc_layers[start:]
+        desc = f'last {last_n} of {n_total}'
+    else:                                                                  # Line 8: use all layers
+        selected = enc_layers
+        desc = f'all {n_total}'
+
+    modules = []                                                           # Line 9: collect MLP modules
+    for layer in selected:                                                 # Line 10: iterate selected layers
+        if hasattr(layer, 'mlp'):                                          # Line 11: standard ViT naming
+            modules.append(layer.mlp)
+        elif hasattr(layer, 'feed_forward'):                               # Line 12: InternViT alternative naming
+            modules.append(layer.feed_forward)
+
+    # Estimate neuron count from first MLP's fc1 output dimension
+    total_neurons = 0                                                      # Line 13: accumulate neuron count
+    if modules:
+        sample_mlp = modules[0]
+        if hasattr(sample_mlp, 'fc1'):                                     # Line 14: standard ViT MLP (fc1 → act → fc2)
+            total_neurons = sample_mlp.fc1.out_features * len(modules)
+        elif hasattr(sample_mlp, 'gate_proj'):                             # Line 15: SwiGLU-style
+            total_neurons = sample_mlp.gate_proj.out_features * len(modules)
+
+    print(f'  Encoder: {desc} layers → {len(modules)} MLPs '
+          f'(~{total_neurons} neurons)')
+
+    return modules, total_neurons, n_total
+
+
+def get_projector_module(model, model_type):
+    """Return the vision-language projector module(s).
+
+    The projector bridges the vision encoder to the LLM. Each
+    architecture names it differently:
+      - LLaVA-OV:  model.multi_modal_projector (2-layer MLP)
+      - Qwen2.5-VL: model.visual.merger (spatial merge MLP)
+      - InternVL:   model.mlp1 (Sequential MLP)
+      - HF LLaVA:   model.multi_modal_projector (Linear or MLP)
+
+    Args:
+        model: loaded VLM model
+        model_type: backend string
+
+    Returns:
+        module: nn.Module — the projector module
+        total_neurons: int — approximate neuron count in the projector
+    """
+    if model_type == 'llava-ov':                                           # Line 1: LLaVA-OV projector
+        proj = model.multi_modal_projector
+    elif model_type == 'qwen2vl':                                          # Line 2: Qwen2.5-VL merger
+        proj = model.visual.merger
+    elif model_type == 'internvl':                                         # Line 3: InternVL mlp1
+        proj = model.mlp1
+    elif model_type == 'hf':                                               # Line 4: HF LLaVA projector
+        proj = model.multi_modal_projector
+    else:                                                                  # Line 5: liuhaotian LLaVA
+        proj = model.model.mm_projector
+
+    # Estimate neuron count by inspecting submodules
+    total_neurons = 0                                                      # Line 6: accumulate
+    for name, sub in proj.named_modules():                                 # Line 7: walk submodules
+        if isinstance(sub, torch.nn.Linear):                               # Line 8: count neurons in linear layers
+            total_neurons += sub.out_features
+
+    print(f'  Projector: ~{total_neurons} neurons across '
+          f'{sum(1 for _ in proj.parameters())} parameter tensors')
+
+    return proj, total_neurons
+
+
+def make_scaling_hooks(modules, alpha):
+    """Register forward hooks that scale the output of given modules by alpha.
+
+    Used for encoder and projector steering where we scale the entire
+    module output rather than targeting individual neurons. This is
+    simpler than make_ablation_hooks because:
+      1. We don't need per-neuron indices — we scale everything
+      2. The modules are already resolved — no layer lookup needed
+      3. Alpha is the only intervention (no zero/mean/noise variants)
+
+    Args:
+        modules: list of nn.Module — modules to attach hooks to
+            Can be a single module (projector) or list (encoder layers)
+        alpha: float — scaling factor (0 = full suppression, 1 = no change,
+               >1 = amplification)
+
+    Returns:
+        handles: list of hook handles (call .remove() to deregister)
+    """
+    if not isinstance(modules, (list, tuple)):                             # Line 1: wrap single module in list
+        modules = [modules]
+
+    handles = []                                                           # Line 2: collect hook handles
+    for mod in modules:                                                    # Line 3: iterate modules
+        def hook_fn(module, input, output, _alpha=alpha):                  # Line 4: closure captures alpha
+            if isinstance(output, tuple):                                  # Line 5: handle tuple output
+                scaled = output[0] * _alpha
+                return (scaled,) + output[1:]
+            return output * _alpha                                         # Line 6: scale tensor output
+        h = mod.register_forward_hook(hook_fn)                             # Line 7: attach hook
+        handles.append(h)                                                  # Line 8: save handle
+
+    return handles                                                         # Line 9: list of handles
 
 
 def load_model_llava_ov(model_path, device):
@@ -792,7 +996,7 @@ def load_model_llava_ov(model_path, device):
 # ═══════════════════════════════════════════════════════════════════
 
 def make_ablation_hooks(model, model_type, ablate_indices, n_layers=32,
-                        method='zero', neuron_stats=None, seed=42):
+                        method='zero', neuron_stats=None, seed=42, alpha=None):
     """Register forward hooks that ablate specified neurons at act_fn output.
 
     Args:
@@ -811,6 +1015,9 @@ def make_ablation_hooks(model, model_type, ablate_indices, n_layers=32,
             Required for mean/noise/clamp methods. Obtained from
             collect_neuron_stats().
         seed: random seed for noise method
+        alpha: if not None, scale activations by this factor instead of
+            ablating. Overrides method. E.g. alpha=0.5 halves activations,
+            alpha=2.0 doubles them.
 
     Returns:
         list of hook handles (call .remove() to deregister)
@@ -851,9 +1058,15 @@ def make_ablation_hooks(model, model_type, ablate_indices, n_layers=32,
 
         def hook_fn(module, input, output, _indices=indices_tensor,
                     _method=method, _repl=replacement_vals,
-                    _noise_params=vals if method == 'noise' else None):
+                    _noise_params=vals if method == 'noise' else None,
+                    _alpha=alpha):
             device = output.device
             idx = _indices.to(device)
+
+            # Steering mode: scale activations by alpha (overrides method)
+            if _alpha is not None:
+                output[:, :, idx] = output[:, :, idx] * _alpha
+                return output
 
             if _method == 'zero':
                 # Set activations to exactly 0
@@ -911,6 +1124,8 @@ def build_ablation_indices(condition, neuron_indices_by_type, labels_by_layer,
         'ablate_text': 'text',
         'ablate_vis': 'visual',
         'ablate_multi': 'multimodal',
+        'ablate_multimodal': 'multimodal',
+        'ablate_unknown': 'unknown',
     }
 
     if condition in type_map:
@@ -1788,7 +2003,14 @@ def parse_args():
     p.add_argument('--conditions', nargs='+',
                    default=['baseline', 'ablate_text', 'ablate_vis',
                             'ablate_multi', 'random'],
-                   help='Ablation conditions to run')
+                   help='Ablation conditions to run. Options: baseline, '
+                        'ablate_text, ablate_vis, ablate_multi, '
+                        'ablate_multimodal, ablate_unknown, random, '
+                        'ablate_encoder, ablate_projector')
+    p.add_argument('--encoder_last_n', type=int, default=None,
+                   help='Number of encoder layers to target for '
+                        'ablate_encoder (counting from end). '
+                        'Default: None = all encoder layers.')
     p.add_argument('--num_images', type=int, default=100,
                    help='Number of images for evaluation')
 
@@ -1854,6 +2076,10 @@ def parse_args():
                         'with dataset mean), noise (Gaussian noise matching '
                         'neuron stats), clamp_high (set to 95th percentile), '
                         'clamp_low (set to 5th percentile)')
+    p.add_argument('--alpha', type=float, default=None,
+                   help='Steering mode: scale target neuron activations '
+                        'by this factor instead of ablating. E.g. --alpha 0.5 '
+                        'halves activations, --alpha 2.0 doubles them.')
     p.add_argument('--top_n', type=int, default=None,
                    help='Ablate only the top N most confident neurons per type '
                         '(for start-small-scale-up / ablation curve)')
@@ -1870,18 +2096,42 @@ def parse_args():
                    help='Number of reference images for computing neuron '
                         'activation stats (mean/noise/clamp methods)')
     p.add_argument('--ranking_method', default='label',
-                   choices=['label', 'cett'],
+                   choices=['label', 'cett', 'combined'],
                    help='How to rank neurons for top_n / curve selection: '
                         '"label" uses classification confidence (1-p_value or '
                         'class probability), "cett" uses total CETT = '
-                        'mean_activation × ||down_proj column||, ranking by '
-                        'actual impact on layer output')
+                        'mean_activation × ||down_proj column||, "combined" '
+                        'uses confidence × normalized_cett to prioritize '
+                        'neurons that are both strongly typed and functionally '
+                        'impactful')
     p.add_argument('--n_cett_images', type=int, default=30,
                    help='Number of reference images for CETT computation')
+    p.add_argument('--halluc_scores_path', default=None,
+                   help='Path to per-neuron hallucination scores JSON from '
+                        'step 10 (combined_halluc_scores.json, '
+                        'ablation_scores.json, or cett_diff_scores.json). '
+                        'When provided, top_n/curve ranks neurons by halluc '
+                        'score within each category instead of classification '
+                        'confidence or CETT. Format: {"layer_neuron": score}')
+
+    # Sharding: run only a slice of the (condition × top_n) runs
+    p.add_argument('--start_idx', type=int, default=None,
+                   help='Start index into the flat list of '
+                        '(condition × top_n) runs (inclusive). '
+                        'Used for parallelising across job shards.')
+    p.add_argument('--end_idx', type=int, default=None,
+                   help='End index into the flat list of '
+                        '(condition × top_n) runs (exclusive). '
+                        'Used for parallelising across job shards.')
 
     # Merge mode
     p.add_argument('--merge', action='store_true',
                    help='Merge per-condition results into summary, then exit')
+    p.add_argument('--merge_shards', type=str, default=None,
+                   help='Path to shards parent dir (e.g. results/shards/). '
+                        'Collects ablation_condition_*.json from each shard_*/ '
+                        'sub-directory into --output_dir, then runs the normal '
+                        'merge to produce ablation_summary.json.')
 
     return p.parse_args()
 
@@ -1981,6 +2231,46 @@ def merge_results(args):
     print(f'\nSaved → {summary_path}')
 
 
+def merge_shard_results(args):
+    """Collect ablation_condition_*.json from shard sub-dirs into --output_dir,
+    then invoke the normal merge_results() to produce ablation_summary.json.
+
+    Called by the pipeline as:
+        python neuron_ablation_validate.py \
+            --merge_shards results/.../shards \
+            --output_dir   results/...
+    """
+    shards_dir = args.merge_shards                             # parent of shard_0/, shard_1/, …
+    output_dir = args.output_dir                               # final destination for merged results
+    os.makedirs(output_dir, exist_ok=True)                     # ensure output dir exists
+
+    # ── Discover shard sub-directories ──────────────────────
+    shard_dirs = sorted(glob.glob(os.path.join(shards_dir, 'shard_*')))
+    if not shard_dirs:                                         # fall back: maybe files are directly in shards_dir
+        shard_dirs = [shards_dir]
+
+    print(f'merge_shard_results: scanning {len(shard_dirs)} shard dirs under {shards_dir}')
+
+    # ── Copy per-condition JSONs into the output directory ──
+    copied = 0                                                 # counter for copied files
+    for sd in shard_dirs:                                      # iterate each shard_N/ sub-dir
+        pattern = os.path.join(sd, 'ablation_condition_*.json')
+        for src_path in sorted(glob.glob(pattern)):            # find all condition files in this shard
+            fname = os.path.basename(src_path)                 # e.g. ablation_condition_baseline.json
+            dst_path = os.path.join(output_dir, fname)         # target path in output_dir
+            if os.path.isfile(dst_path):                       # skip if already present (idempotent)
+                print(f'  [skip] {fname} (already in output_dir)')
+                continue
+            shutil.copy2(src_path, dst_path)                   # copy preserving metadata
+            copied += 1
+            print(f'  copied {fname} from {os.path.basename(sd)}/')
+
+    print(f'  Copied {copied} condition files → {output_dir}')
+
+    # ── Delegate to the standard merge to build ablation_summary.json ──
+    merge_results(args)                                        # reuses args.output_dir
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Section 9 — Main
 # ═══════════════════════════════════════════════════════════════════
@@ -1988,6 +2278,10 @@ def merge_results(args):
 def main():
     args = parse_args()
     _normalise_model_type(args)
+
+    if args.merge_shards:
+        merge_shard_results(args)
+        return
 
     if args.merge:
         merge_results(args)
@@ -2060,7 +2354,7 @@ def main():
         tokenizer_or_processor = processor                                # LLaVA-OV: processor handles both modalities
     else:  # qwen2vl
         model, processor, image_processor, image_token_id = load_model_qwen2vl(
-            args.qwen2vl_path, device)
+            args.original_model_path, device)
         tokenizer_or_processor = processor                                # Qwen2.5-VL: processor handles both modalities
     print('  Model loaded.')
 
@@ -2086,7 +2380,7 @@ def main():
 
     # ── Compute CETT rankings (if requested) ──
     cett_scores = None
-    if args.ranking_method == 'cett':
+    if args.ranking_method in ('cett', 'combined'):
         cett_img_dir = args.pope_img_dir or args.chair_img_dir
         if cett_img_dir:
             cett_ranked, cett_scores = compute_cett_rankings(
@@ -2095,9 +2389,42 @@ def main():
                 cett_img_dir, labels_by_layer, device,
                 n_images=args.n_cett_images, n_layers=n_layers, seed=args.seed)
 
-            # Override the label-based rankings with CETT-based rankings
-            ranked_neurons = cett_ranked
-            print(f'  Using CETT rankings (overriding label confidence)')
+            if args.ranking_method == 'cett':
+                # Override the label-based rankings with CETT-based rankings
+                ranked_neurons = cett_ranked
+                print(f'  Using CETT rankings (overriding label confidence)')
+
+            elif args.ranking_method == 'combined':
+                # Combined ranking: confidence × normalized_cett
+                # Normalize CETT scores globally to [0, 1]
+                all_cett = np.concatenate([s for s in cett_scores.values()])
+                cett_min = float(all_cett.min())
+                cett_max = float(all_cett.max())
+                cett_range = cett_max - cett_min if cett_max > cett_min else 1.0
+
+                combined_ranked = {'visual': [], 'text': [],
+                                   'multimodal': [], 'unknown': []}
+                for layer_idx, neuron_list in raw_by_layer.items():
+                    layer_cett = cett_scores.get(layer_idx, None)
+                    for ndata in neuron_list:
+                        label = ndata['label']
+                        if label not in combined_ranked:
+                            continue
+                        nidx = ndata['neuron_idx']
+                        conf = get_confidence_score(ndata, args.label_source)
+                        cett_val = float(layer_cett[nidx]) if layer_cett is not None else 0.0
+                        norm_cett = (cett_val - cett_min) / cett_range
+                        combined_score = conf * norm_cett
+                        combined_ranked[label].append(
+                            (layer_idx, nidx, combined_score))
+
+                for label in combined_ranked:
+                    combined_ranked[label].sort(
+                        key=lambda x: x[2], reverse=True)
+
+                ranked_neurons = combined_ranked
+                print(f'  Using combined rankings '
+                      f'(confidence × normalized_cett)')
 
             # Save CETT scores for analysis
             cett_path = os.path.join(args.output_dir, 'cett_scores.json')
@@ -2112,6 +2439,15 @@ def main():
             print('  WARNING: No image dir for CETT computation. '
                   'Falling back to label-based ranking.')
             args.ranking_method = 'label'
+
+    # ── Override ranking with hallucination scores (if provided) ──
+    if args.halluc_scores_path is not None:
+        print(f'\n  Re-ranking neurons by hallucination scores...')
+        print(f'  Source: {args.halluc_scores_path}')
+        ranked_neurons = rerank_by_halluc_scores(                          # Line R1: replace ranking with halluc scores
+            ranked_neurons, args.halluc_scores_path)
+        print(f'  Neurons now ranked by hallucination score '
+              f'(overriding {args.ranking_method})')
 
     # ── Collect neuron stats (needed for mean/noise/clamp methods) ──
     neuron_stats = None
@@ -2208,29 +2544,75 @@ def main():
     else:
         top_n_values = [None]  # None = ablate all neurons of the type
 
+    # ── Build flat list of (condition, top_n) runs and optionally slice ──
+    all_runs = [(cond, tn) for cond in args.conditions for tn in top_n_values]
+
+    # Apply shard slicing if --start_idx / --end_idx are provided
+    if args.start_idx is not None or args.end_idx is not None:
+        s = args.start_idx if args.start_idx is not None else 0           # default: start from 0
+        e = args.end_idx   if args.end_idx   is not None else len(all_runs)  # default: go to end
+        print(f'\n  Sharding: running runs [{s}:{e}] out of {len(all_runs)} total')
+        all_runs = all_runs[s:e]
+
     # ── Run each (condition × top_n) combination ──
-    for condition in args.conditions:
-        for top_n in top_n_values:
-            # Build a descriptive run name
-            run_name = condition
+    for condition, top_n in all_runs:
+        # Build a descriptive run name
+        run_name = condition
+        if top_n is not None:
+            run_name = f'{condition}_top{top_n}'
+        if layer_range:
+            run_name = f'{run_name}_L{layer_range[0]}-{layer_range[1]}'
+        if args.ablation_method != 'zero':
+            run_name = f'{run_name}_{args.ablation_method}'
+
+        print(f'\n{"="*60}')
+        print(f'CONDITION: {run_name}')
+        print(f'{"="*60}')
+
+        # Check if already done
+        marker_path = os.path.join(args.output_dir,
+                                   f'ablation_condition_{run_name}.json')
+        if os.path.isfile(marker_path):
+            print(f'  [skip] Already complete — {marker_path}')
+            continue
+
+        # ── Encoder / Projector conditions (different hook path) ──
+        if condition in ('ablate_encoder', 'ablate_projector'):
+            # These scale entire module outputs by alpha, not individual
+            # LLM neurons. top_n is ignored — we always scale the full
+            # component. In curve mode, these appear as single reference
+            # points at the component's total neuron count.
             if top_n is not None:
-                run_name = f'{condition}_top{top_n}'
-            if layer_range:
-                run_name = f'{run_name}_L{layer_range[0]}-{layer_range[1]}'
-            if args.ablation_method != 'zero':
-                run_name = f'{run_name}_{args.ablation_method}'
-
-            print(f'\n{"="*60}')
-            print(f'CONDITION: {run_name}')
-            print(f'{"="*60}')
-
-            # Check if already done
-            marker_path = os.path.join(args.output_dir,
-                                       f'ablation_condition_{run_name}.json')
-            if os.path.isfile(marker_path):
-                print(f'  [skip] Already complete — {marker_path}')
+                # Skip curve sub-steps for encoder/projector — only run once
+                # with all neurons (the None top_n entry)
+                print(f'  [skip] {condition} ignores top_n={top_n} '
+                      f'(runs once with all neurons)')
                 continue
 
+            if condition == 'ablate_encoder':
+                enc_modules, n_ablated, n_enc_total = get_encoder_mlp_modules(
+                    model, args.model_type, last_n=args.encoder_last_n)
+                handles = make_scaling_hooks(enc_modules, args.alpha)
+                if args.encoder_last_n is not None:
+                    component_desc = (f'encoder (last {args.encoder_last_n} of '
+                                      f'{n_enc_total} ViT layers)')
+                else:
+                    component_desc = (f'encoder (all {n_enc_total} ViT layers)')
+            else:  # ablate_projector
+                proj_module, n_ablated = get_projector_module(
+                    model, args.model_type)
+                handles = make_scaling_hooks(proj_module, args.alpha)
+                component_desc = 'projector'
+
+            n_layers_ablated = 0  # not applicable
+            total_model_neurons = n_layers_found * n_neurons_per_layer
+            pct = 100 * n_ablated / total_model_neurons if total_model_neurons else 0
+            print(f'  Scaling {component_desc} by alpha={args.alpha} '
+                  f'(~{n_ablated} neurons, {pct:.2f}% of LLM)')
+            print(f'  Registered {len(handles)} scaling hooks')
+
+        # ── Standard LLM neuron conditions ──
+        else:
             # Build ablation indices
             ablate_indices = build_ablation_indices(
                 condition, neuron_indices_by_type, labels_by_layer,
@@ -2247,109 +2629,111 @@ def main():
             handles = make_ablation_hooks(
                 model, args.model_type, ablate_indices,
                 method=args.ablation_method,
-                neuron_stats=neuron_stats, seed=args.seed)
+                neuron_stats=neuron_stats, seed=args.seed,
+                alpha=args.alpha)
             print(f'  Registered {len(handles)} ablation hooks')
 
-            result = {
-                'condition': run_name,
-                'base_condition': condition,
-                'ablation_method': args.ablation_method,
-                'ranking_method': args.ranking_method,
-                'top_n': top_n,
-                'layer_range': list(layer_range) if layer_range else None,
-                'n_neurons_ablated': n_ablated,
-                'n_layers_ablated': n_layers_ablated,
-                'pct_neurons_ablated': round(pct, 2),
-            }
+        result = {
+            'condition': run_name,
+            'base_condition': condition,
+            'ablation_method': args.ablation_method,
+            'ranking_method': args.ranking_method,
+            'halluc_scores_path': args.halluc_scores_path,
+            'top_n': top_n,
+            'layer_range': list(layer_range) if layer_range else None,
+            'n_neurons_ablated': n_ablated,
+            'n_layers_ablated': n_layers_ablated,
+            'pct_neurons_ablated': round(pct, 2),
+        }
 
-            t0 = time.time()
+        t0 = time.time()
 
-            # POPE evaluation
-            if pope_questions and args.pope_img_dir:
-                print(f'\n  Running POPE evaluation ({len(pope_questions)} questions) ...')
-                pope_result = evaluate_pope(
-                    model, args.model_type, tokenizer_or_processor,
-                    image_processor, image_token_id,
-                    pope_questions, args.pope_img_dir, device)
-                result['pope'] = pope_result
-                print(f'  POPE: accuracy={pope_result["accuracy"]:.4f}  '
-                      f'F1={pope_result["f1"]:.4f}  '
-                      f'yes_ratio={pope_result["yes_ratio"]:.4f}')
+        # POPE evaluation
+        if pope_questions and args.pope_img_dir:
+            print(f'\n  Running POPE evaluation ({len(pope_questions)} questions) ...')
+            pope_result = evaluate_pope(
+                model, args.model_type, tokenizer_or_processor,
+                image_processor, image_token_id,
+                pope_questions, args.pope_img_dir, device)
+            result['pope'] = pope_result
+            print(f'  POPE: accuracy={pope_result["accuracy"]:.4f}  '
+                  f'F1={pope_result["f1"]:.4f}  '
+                  f'yes_ratio={pope_result["yes_ratio"]:.4f}')
 
-            # CHAIR evaluation
-            if args.chair_ann_path and args.chair_img_dir:
-                print(f'\n  Running CHAIR evaluation ({args.chair_num_images} images) ...')
-                chair_result = evaluate_chair(
-                    model, args.model_type, tokenizer_or_processor,
-                    image_processor, image_token_id,
-                    args.chair_ann_path, args.chair_img_dir, device,
-                    num_images=args.chair_num_images, seed=args.seed)
-                result['chair'] = chair_result
-                print(f'  CHAIR_i={chair_result["chair_i"]:.4f}  '
-                      f'CHAIR_s={chair_result["chair_s"]:.4f}')
+        # CHAIR evaluation
+        if args.chair_ann_path and args.chair_img_dir:
+            print(f'\n  Running CHAIR evaluation ({args.chair_num_images} images) ...')
+            chair_result = evaluate_chair(
+                model, args.model_type, tokenizer_or_processor,
+                image_processor, image_token_id,
+                args.chair_ann_path, args.chair_img_dir, device,
+                num_images=args.chair_num_images, seed=args.seed)
+            result['chair'] = chair_result
+            print(f'  CHAIR_i={chair_result["chair_i"]:.4f}  '
+                  f'CHAIR_s={chair_result["chair_s"]:.4f}')
 
-            # VQAv2 evaluation (overall)
-            vqa_img = args.vqav2_img_dir or args.pope_img_dir              # Line V1: fallback to pope_img_dir
-            if vqa_items and vqa_img:
-                print(f'\n  Running VQAv2 evaluation ({len(vqa_items)} questions) ...')
-                vqa_result = evaluate_vqav2(
-                    model, args.model_type, tokenizer_or_processor,
-                    image_processor, image_token_id,
-                    vqa_items, vqa_img, device)
-                result['vqav2'] = vqa_result
-                print(f'  VQAv2: accuracy={vqa_result["accuracy"]:.4f}')
+        # VQAv2 evaluation (overall)
+        vqa_img = args.vqav2_img_dir or args.pope_img_dir              # Line V1: fallback to pope_img_dir
+        if vqa_items and vqa_img:
+            print(f'\n  Running VQAv2 evaluation ({len(vqa_items)} questions) ...')
+            vqa_result = evaluate_vqav2(
+                model, args.model_type, tokenizer_or_processor,
+                image_processor, image_token_id,
+                vqa_items, vqa_img, device)
+            result['vqav2'] = vqa_result
+            print(f'  VQAv2: accuracy={vqa_result["accuracy"]:.4f}')
 
-            # VQA-Perception evaluation
-            if vqa_perception_items and vqa_img:                           # Line V2: reuse vqa_img
-                print(f'\n  Running VQA-Perception evaluation ({len(vqa_perception_items)} questions) ...')
-                vqa_perc_result = evaluate_vqav2(                          # Line V3: same eval function
-                    model, args.model_type, tokenizer_or_processor,
-                    image_processor, image_token_id,
-                    vqa_perception_items, vqa_img, device)
-                result['vqa_perception'] = vqa_perc_result                 # Line V4: store under split key
-                print(f'  VQA-Perception: accuracy={vqa_perc_result["accuracy"]:.4f}')
+        # VQA-Perception evaluation
+        if vqa_perception_items and vqa_img:                           # Line V2: reuse vqa_img
+            print(f'\n  Running VQA-Perception evaluation ({len(vqa_perception_items)} questions) ...')
+            vqa_perc_result = evaluate_vqav2(                          # Line V3: same eval function
+                model, args.model_type, tokenizer_or_processor,
+                image_processor, image_token_id,
+                vqa_perception_items, vqa_img, device)
+            result['vqa_perception'] = vqa_perc_result                 # Line V4: store under split key
+            print(f'  VQA-Perception: accuracy={vqa_perc_result["accuracy"]:.4f}')
 
-            # VQA-Knowledge evaluation
-            if vqa_knowledge_items and vqa_img:                            # Line V5: reuse vqa_img
-                print(f'\n  Running VQA-Knowledge evaluation ({len(vqa_knowledge_items)} questions) ...')
-                vqa_know_result = evaluate_vqav2(                          # Line V6: same eval function
-                    model, args.model_type, tokenizer_or_processor,
-                    image_processor, image_token_id,
-                    vqa_knowledge_items, vqa_img, device)
-                result['vqa_knowledge'] = vqa_know_result                  # Line V7: store under split key
-                print(f'  VQA-Knowledge: accuracy={vqa_know_result["accuracy"]:.4f}')
+        # VQA-Knowledge evaluation
+        if vqa_knowledge_items and vqa_img:                            # Line V5: reuse vqa_img
+            print(f'\n  Running VQA-Knowledge evaluation ({len(vqa_knowledge_items)} questions) ...')
+            vqa_know_result = evaluate_vqav2(                          # Line V6: same eval function
+                model, args.model_type, tokenizer_or_processor,
+                image_processor, image_token_id,
+                vqa_knowledge_items, vqa_img, device)
+            result['vqa_knowledge'] = vqa_know_result                  # Line V7: store under split key
+            print(f'  VQA-Knowledge: accuracy={vqa_know_result["accuracy"]:.4f}')
 
-            # TriviaQA evaluation (text-only, uses dummy blank image)
-            if triviaqa_items:
-                print(f'\n  Running TriviaQA evaluation ({len(triviaqa_items)} questions) ...')
-                triviaqa_result = evaluate_triviaqa(
-                    model, args.model_type, tokenizer_or_processor,
-                    image_processor, image_token_id,
-                    triviaqa_items, device)
-                result['triviaqa'] = triviaqa_result
-                print(f'  TriviaQA: accuracy={triviaqa_result["accuracy"]:.4f}')
+        # TriviaQA evaluation (text-only, uses dummy blank image)
+        if triviaqa_items:
+            print(f'\n  Running TriviaQA evaluation ({len(triviaqa_items)} questions) ...')
+            triviaqa_result = evaluate_triviaqa(
+                model, args.model_type, tokenizer_or_processor,
+                image_processor, image_token_id,
+                triviaqa_items, device)
+            result['triviaqa'] = triviaqa_result
+            print(f'  TriviaQA: accuracy={triviaqa_result["accuracy"]:.4f}')
 
-            # MMLU evaluation (text-only, uses dummy blank image)
-            if mmlu_items:
-                print(f'\n  Running MMLU evaluation ({len(mmlu_items)} questions) ...')
-                mmlu_result = evaluate_mmlu(
-                    model, args.model_type, tokenizer_or_processor,
-                    image_processor, image_token_id,
-                    mmlu_items, device)
-                result['mmlu'] = mmlu_result
-                print(f'  MMLU: accuracy={mmlu_result["accuracy"]:.4f}')
+        # MMLU evaluation (text-only, uses dummy blank image)
+        if mmlu_items:
+            print(f'\n  Running MMLU evaluation ({len(mmlu_items)} questions) ...')
+            mmlu_result = evaluate_mmlu(
+                model, args.model_type, tokenizer_or_processor,
+                image_processor, image_token_id,
+                mmlu_items, device)
+            result['mmlu'] = mmlu_result
+            print(f'  MMLU: accuracy={mmlu_result["accuracy"]:.4f}')
 
-            elapsed = time.time() - t0
-            result['time_sec'] = round(elapsed, 1)
+        elapsed = time.time() - t0
+        result['time_sec'] = round(elapsed, 1)
 
-            # Remove hooks
-            for h in handles:
-                h.remove()
+        # Remove hooks
+        for h in handles:
+            h.remove()
 
-            # Save per-condition result
-            with open(marker_path, 'w') as f:
-                json.dump(result, f, indent=2)
-            print(f'\n  Saved → {marker_path} ({elapsed:.1f}s)')
+        # Save per-condition result
+        with open(marker_path, 'w') as f:
+            json.dump(result, f, indent=2)
+        print(f'\n  Saved → {marker_path} ({elapsed:.1f}s)')
 
     # ── Auto-merge if all conditions ran in this process ──
     print(f'\n{"="*60}')
@@ -2359,4632 +2743,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-# #!/usr/bin/env python3
-# """
-# neuron_ablation_validate.py — Ablation validation of neuron taxonomy
-
-# Validates the neuron classification (visual / text / multimodal / unknown)
-# by selectively ablating neurons of each type and measuring
-# the impact on downstream tasks:
-
-#   - POPE: Polling-based Object Probing Evaluation (yes/no accuracy + F1)
-#   - CHAIR: Caption Hallucination Assessment with Image Relevance
-
-# Implements 7 ablation approaches:
-
-#   1. Ablation curve (--curve)
-#      Sweep top_n = 100, 500, 1000, 5000, all neurons per type.
-#      Shows whether a small set suffices or whether effect is distributed.
-
-#   2. Layer-specific ablation (--layer_range 0-10)
-#      Restrict ablation to a subset of layers to find where each
-#      modality's neurons are most functionally important.
-
-#   3. Mean ablation (--ablation_method mean)
-#      Replace with per-neuron mean activation instead of zeroing.
-#      Less disruptive — tests whether input-specific signal matters.
-
-#   4. Noise ablation (--ablation_method noise)
-#      Replace with N(mean, std) Gaussian noise per neuron.
-#      Tests whether the neuron's specific signal matters vs any signal.
-#      NOTE: Noise ablation can cause the model to generate endlessly when
-#      activations are corrupted, leading to very long runtimes or timeouts.
-#      Consider adding a max_new_tokens cap to keep generation bounded.
-
-#   5. Activation clamping (--ablation_method clamp_high / clamp_low)
-#      Set to 95th or 5th percentile. Tests direction of effect.
-
-#   6. Neuron count matching (built into 'random' condition)
-#      Random baseline always matches the targeted ablation count.
-#      Controlled automatically when using --top_n or --curve.
-
-#   7. Start small, scale up (--top_n 100 / --top_n 500 / --top_n 1000)
-#      Rank neurons by classification confidence, ablate only the most
-#      confident ones first. Equivalent to specific points on the curve.
-
-#   8. CETT ranking (--ranking_method cett)
-#      Ranks neurons by their actual impact on the layer output,
-#      not just activation magnitude. For each neuron:
-#      total_cett_j = mean_activation_j × ||down_proj[:, j]||
-#      A neuron with high activation but tiny down_proj column has
-#      low CETT (fires hard but the model ignores it). Same metric
-#      for all neuron types — labels handle grouping, CETT handles
-#      ordering within each group. Ablating higher-CETT neurons
-#      first causes more disruption per neuron removed.
-
-# Conditions:
-#   baseline     — no ablation (original model)
-#   ablate_text  — ablate text-classified neurons
-#   ablate_vis   — ablate visual-classified neurons
-#   ablate_multi — ablate multimodal-classified neurons
-#   random       — ablate a random subset (matched count)
-
-# Usage examples:
-#     # Basic: all neurons, zero ablation
-#     python neuron_ablation_validate.py --conditions baseline ablate_vis random
-
-#     # Ablation curve: sweep top_n for visual neurons
-#     python neuron_ablation_validate.py --curve \\
-#         --conditions baseline ablate_vis random
-
-#     # Top-100 most confident visual neurons with mean ablation
-#     python neuron_ablation_validate.py --top_n 100 \\
-#         --ablation_method mean --conditions baseline ablate_vis random
-
-#     # Layer-specific: only layers 0-10
-#     python neuron_ablation_validate.py --layer_range 0-10 \\
-#         --conditions baseline ablate_vis ablate_text random
-
-#     # CETT ranking with ablation curve
-#     python neuron_ablation_validate.py --curve --ranking_method cett \\
-#         --conditions baseline ablate_vis random
-
-#     # Merge per-condition results:
-#     python neuron_ablation_validate.py --merge --output_dir results/ablation/
-# """
-
-# import argparse
-# import csv
-# import json
-# import glob
-# import os
-# import re
-# import string
-# import sys
-# import time
-
-# # Add LLaVA repo to path (needed for original model backend)
-# _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-# _LLAVA_PATH = os.path.join(_PROJECT_ROOT, 'LLaVA')
-# if _LLAVA_PATH not in sys.path:
-#     sys.path.insert(0, _LLAVA_PATH)
-
-# import numpy as np
-# import torch
-# from PIL import Image
-# from tqdm import tqdm
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 1 — Label loading
-# # ═══════════════════════════════════════════════════════════════════
-
-# def load_neuron_labels(labels_dir, model_type='liuhaotian', n_layers=32,
-#                        label_source='llm_permutation'):
-#     """Load per-layer neuron labels from the classification output.
-
-#     Args:
-#         labels_dir: path to permutation/ or fixed_threshold/ dir
-#         model_type: 'hf' or 'liuhaotian' — determines layer name prefix
-#         n_layers: total number of LLM layers (32 for LLaVA-7B)
-#         label_source: 'llm_permutation' or 'xu' — selects label filename
-
-#     Returns:
-#         labels_by_layer: dict {layer_idx: list of label strings}
-#         raw_by_layer: dict {layer_idx: list of full neuron dicts}
-#             Each dict has keys like neuron_idx, label, and confidence
-#             fields (pv/pt/pm/pu for xu; p_value/observed_rate_diff
-#             for permutation).
-#     """
-#     if model_type in ('hf',):
-#         prefix = 'model.language_model.layers'
-#     else:
-#         prefix = 'model.layers'
-
-#     # Select label filename based on source method
-#     if label_source == 'llm_permutation':
-#         label_filename = 'neuron_labels_permutation.json'
-#     elif label_source == 'llm_pmbt':
-#         label_filename = 'neuron_labels_pmbt.json'           # PMBT (Population-Median Binomial Test)
-#     else:
-#         label_filename = 'neuron_labels.json'
-
-#     labels_by_layer = {}
-#     raw_by_layer = {}
-#     for layer_idx in range(n_layers):
-#         layer_name = f'{prefix}.{layer_idx}.mlp.act_fn'
-#         label_path = os.path.join(labels_dir, layer_name, label_filename)
-#         if not os.path.isfile(label_path):
-#             continue
-#         with open(label_path) as f:
-#             neuron_data = json.load(f)
-#         labels_by_layer[layer_idx] = [n['label'] for n in neuron_data]
-#         raw_by_layer[layer_idx] = neuron_data
-
-#     return labels_by_layer, raw_by_layer
-
-
-# def get_neuron_indices_by_type(labels_by_layer):
-#     """Group neuron indices by their classification label.
-
-#     Returns:
-#         by_type: dict {label: dict {layer_idx: list of neuron indices}}
-#     """
-#     by_type = {'visual': {}, 'text': {}, 'multimodal': {}, 'unknown': {}}
-#     for layer_idx, labels in labels_by_layer.items():
-#         for label_type in by_type:
-#             indices = [i for i, l in enumerate(labels) if l == label_type]
-#             if indices:
-#                 by_type[label_type][layer_idx] = indices
-#     return by_type
-
-
-# def get_confidence_score(neuron_dict, label_source='llm_permutation'):
-#     """Extract a confidence score from a neuron's raw data dict.
-
-#     For permutation labels: confidence = 1 - p_value (lower p → more
-#     confident). Tie-break by |observed_rate_diff|.
-#     For xu (fixed-threshold) labels: confidence = probability of the
-#     assigned label (pv for visual, pt for text, pm for multimodal).
-
-#     Args:
-#         neuron_dict: single neuron dict from raw_by_layer
-#         label_source: 'llm_permutation' or 'xu'
-
-#     Returns:
-#         float confidence score (higher = more confident classification)
-#     """
-#     label = neuron_dict['label']
-#     if label_source in ('llm_permutation', 'llm_pmbt'):
-#         # 1 - p_value gives a 0→1 confidence where 1 is most significant
-#         return 1.0 - neuron_dict.get('p_value', 1.0)
-#     else:
-#         # xu labels store per-class probabilities pv/pt/pm/pu
-#         prob_map = {'visual': 'pv', 'text': 'pt',
-#                     'multimodal': 'pm', 'unknown': 'pu'}
-#         key = prob_map.get(label, 'pu')
-#         return neuron_dict.get(key, 0.0)
-
-
-# def get_ranked_neurons_by_type(raw_by_layer, label_source='llm_permutation'):
-#     """Rank all neurons of each type globally by confidence score.
-
-#     Returns:
-#         ranked: dict {label: list of (layer_idx, neuron_idx, score)}
-#             Sorted descending by confidence score.
-#     """
-#     ranked = {'visual': [], 'text': [], 'multimodal': [], 'unknown': []}
-#     for layer_idx, neuron_list in raw_by_layer.items():
-#         for ndata in neuron_list:
-#             label = ndata['label']
-#             if label not in ranked:
-#                 continue
-#             score = get_confidence_score(ndata, label_source)
-#             ranked[label].append((layer_idx, ndata['neuron_idx'], score))
-
-#     # Sort each type by confidence descending
-#     for label in ranked:
-#         ranked[label].sort(key=lambda x: x[2], reverse=True)
-
-#     return ranked
-
-
-# def extract_down_proj_norms(model, model_type, n_layers=32):
-#     """Extract the L2 norm of each column of the down_proj weight matrix.
-
-#     In the LLaMA FFN computation:
-#         gate = gate_proj(x)
-#         up   = up_proj(x)
-#         intermediate = silu(gate) * up          ← "neuron activations"
-#         output = down_proj(intermediate)         ← projects back to residual
-
-#     Each neuron j's actual contribution to the layer output is:
-#         contribution_j = activation_j * down_proj[:, j]
-
-#     The column norm ||down_proj[:, j]|| tells you how much the model
-#     amplifies neuron j's signal. A neuron with large activation but
-#     tiny down_proj column has low actual impact.
-
-#     Args:
-#         model: the LLaVA model
-#         model_type: 'hf' or 'liuhaotian'
-#         n_layers: number of LLM layers
-
-#     Returns:
-#         norms: dict {layer_idx: tensor of shape (n_neurons,)}
-#             L2 norm of each down_proj column per layer.
-#     """
-#     norms = {}
-#     for layer_idx in range(n_layers):
-#         if model_type == 'hf':
-#             layer = model.language_model.model.layers[layer_idx]
-#         else:
-#             layer = model.model.layers[layer_idx]
-
-#         # down_proj weight shape: (hidden_size, intermediate_size)
-#         # Column j = down_proj.weight[:, j] = the vector that neuron j
-#         # projects into the residual stream
-#         W_down = layer.mlp.down_proj.weight.detach().float()
-#         # L2 norm of each column (dim=0 gives norm over hidden_size)
-#         col_norms = W_down.norm(dim=0)  # shape: (intermediate_size,)
-#         norms[layer_idx] = col_norms.cpu()
-
-#     return norms
-
-
-# def compute_cett_rankings(model, model_type, tokenizer_or_processor,
-#                           image_processor, image_token_id,
-#                           img_dir, labels_by_layer, device,
-#                           n_images=30, n_layers=32, seed=42):
-#     """Compute total CETT per neuron and return rankings.
-
-#     CETT (Contribution to layer output) for neuron j:
-
-#         total_cett_j = mean_activation_j × ||down_proj[:, j]||
-
-#     mean_activation_j is averaged over all token positions and all
-#     reference images. ||down_proj[:, j]|| is the L2 norm of column j
-#     of the down_proj weight matrix — the model's architectural
-#     amplification factor for neuron j.
-
-#     This ranks neurons by their actual impact on the layer output.
-#     A neuron with high activation but tiny down_proj column has low
-#     CETT (fires hard but the model ignores it). A neuron with modest
-#     activation but large down_proj column has high CETT (the model
-#     amplifies its signal).
-
-#     All neuron types (visual, text, multimodal) are ranked by the
-#     same metric. The labels determine which group a neuron belongs
-#     to; the total CETT determines its rank within that group.
-#     Ablating higher-CETT neurons first causes more disruption to
-#     the layer output.
-
-#     Args:
-#         model, model_type, tokenizer_or_processor, image_processor,
-#             image_token_id: model components
-#         img_dir: path to COCO val images
-#         labels_by_layer: needed to know which neurons exist per layer
-#         device: torch device string
-#         n_images: reference images for CETT estimation
-#         n_layers: number of LLM layers
-#         seed: random seed
-
-#     Returns:
-#         cett_ranked: dict {label: [(layer_idx, neuron_idx, total_cett)]}
-#             Same format as get_ranked_neurons_by_type(), scored by
-#             total CETT. Sorted descending (highest contribution first).
-#         cett_scores: dict {layer_idx: np.array of shape (n_neurons,)}
-#             Total CETT per neuron per layer.
-#     """
-#     print('\n  Computing total CETT rankings ...')
-
-#     # ── Step 1: Extract down_proj column norms (from weights) ──
-#     print('    Extracting down_proj column norms ...')
-#     down_norms = extract_down_proj_norms(model, model_type, n_layers)
-
-#     # ── Step 2: Select reference images ──
-#     rng = np.random.RandomState(seed)
-#     img_files = sorted([f for f in os.listdir(img_dir)
-#                         if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
-#     if len(img_files) > n_images:
-#         img_files = rng.choice(img_files, size=n_images,
-#                                replace=False).tolist()
-
-#     # ── Step 3: Register hooks to accumulate mean activations ──
-#     act_sum = {}  # {layer: array (n_neurons,)} running sum of mean(act)
-#     hooks = []
-
-#     for layer_idx in sorted(labels_by_layer.keys()):
-#         n_neurons = len(labels_by_layer[layer_idx])
-#         act_sum[layer_idx] = np.zeros(n_neurons, dtype=np.float64)
-
-#         if model_type == 'hf':
-#             layer_mod = model.language_model.model.layers[layer_idx]
-#         else:
-#             layer_mod = model.model.layers[layer_idx]
-
-#         act_fn = layer_mod.mlp.act_fn
-
-#         # Only record from the first forward pass per image
-#         # (model.generate calls forward multiple times for each token)
-#         act_fn._cett_recorded = False
-
-#         def make_hook(lidx, act_fn_ref):
-#             def hook_fn(module, input, output):
-#                 if act_fn_ref._cett_recorded:
-#                     return
-#                 # output shape: (1, seq_len, n_neurons)
-#                 # Mean over all token positions → (n_neurons,)
-#                 acts = output[0].detach().float().cpu().numpy()
-#                 act_sum[lidx] += acts.mean(axis=0)
-#                 act_fn_ref._cett_recorded = True
-#             return hook_fn
-
-#         h = act_fn.register_forward_hook(make_hook(layer_idx, act_fn))
-#         hooks.append(h)
-
-#     # ── Step 4: Run forward passes ──
-#     n_processed = 0
-#     print(f'    Running {len(img_files)} forward passes ...')
-
-#     for img_file in tqdm(img_files, desc='CETT'):
-#         img_path = os.path.join(img_dir, img_file)
-#         try:
-#             img = Image.open(img_path).convert('RGB')
-#         except Exception:
-#             continue
-
-#         # Reset recording flags
-#         for layer_idx in labels_by_layer:
-#             if model_type == 'hf':
-#                 act_fn = model.language_model.model.layers[layer_idx].mlp.act_fn
-#             else:
-#                 act_fn = model.model.layers[layer_idx].mlp.act_fn
-#             act_fn._cett_recorded = False
-
-#         # Prepare inputs and run forward pass
-#         with torch.no_grad():
-#             if model_type == 'hf':
-#                 prompt = "USER: <image>\nDescribe this image.\nASSISTANT:"
-#                 inputs = tokenizer_or_processor(
-#                     images=img, text=prompt, return_tensors='pt').to(device)
-#                 model.generate(**inputs, max_new_tokens=1, do_sample=False)
-#             else:
-#                 from llava.conversation import conv_templates
-#                 from llava.constants import IMAGE_TOKEN_INDEX
-#                 from llava.mm_utils import tokenizer_image_token
-
-#                 conv = conv_templates["v1"].copy()
-#                 conv.append_message(conv.roles[0],
-#                                     "<image>\nDescribe this image.")
-#                 conv.append_message(conv.roles[1], None)
-#                 prompt = conv.get_prompt()
-
-#                 input_ids = tokenizer_image_token(
-#                     prompt, tokenizer_or_processor, IMAGE_TOKEN_INDEX,
-#                     return_tensors='pt'
-#                 ).unsqueeze(0).to(device)
-
-#                 image_tensor = image_processor.preprocess(
-#                     img, return_tensors='pt'
-#                 )['pixel_values'].half().to(device)
-
-#                 model.generate(input_ids, images=image_tensor,
-#                                max_new_tokens=1, do_sample=False)
-
-#         n_processed += 1
-
-#     # ── Step 5: Remove hooks and clean up ──
-#     for h in hooks:
-#         h.remove()
-#     for layer_idx in labels_by_layer:
-#         if model_type == 'hf':
-#             act_fn = model.language_model.model.layers[layer_idx].mlp.act_fn
-#         else:
-#             act_fn = model.model.layers[layer_idx].mlp.act_fn
-#         if hasattr(act_fn, '_cett_recorded'):
-#             delattr(act_fn, '_cett_recorded')
-
-#     # ── Step 6: Compute total CETT per neuron ──
-#     cett_scores = {}
-
-#     for layer_idx in sorted(labels_by_layer.keys()):
-#         dn = down_norms[layer_idx].numpy()
-#         n_neurons = len(labels_by_layer[layer_idx])
-#         dn = dn[:n_neurons]
-
-#         # Total CETT = mean_activation × ||down_proj column||
-#         mean_act = act_sum[layer_idx] / max(n_processed, 1)
-#         cett_scores[layer_idx] = mean_act * dn
-
-#     # ── Step 7: Build rankings (same metric for all groups) ──
-#     cett_ranked = {'visual': [], 'text': [], 'multimodal': [], 'unknown': []}
-
-#     for layer_idx, labels in labels_by_layer.items():
-#         scores = cett_scores.get(layer_idx)
-#         if scores is None:
-#             continue
-#         for nidx, label in enumerate(labels):
-#             if label not in cett_ranked:
-#                 continue
-#             cett_ranked[label].append(
-#                 (layer_idx, nidx, float(scores[nidx])))
-
-#     # Sort each type by total CETT descending
-#     for label in cett_ranked:
-#         cett_ranked[label].sort(key=lambda x: x[2], reverse=True)
-
-#     # Print summary
-#     print(f'    Processed {n_processed} images')
-#     for label in ['visual', 'text', 'multimodal']:
-#         ranking = cett_ranked[label]
-#         if ranking:
-#             top = ranking[0]
-#             print(f'    {label:12s} CETT top: layer={top[0]} '
-#                   f'neuron={top[1]} score={top[2]:.6f}  '
-#                   f'({len(ranking)} neurons)')
-
-#     return cett_ranked, cett_scores
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 2 — Model loading (reuses patterns from classification)
-# # ═══════════════════════════════════════════════════════════════════
-
-# def load_model_original(model_path, device):
-#     """Load the original LLaVA model via the LLaVA repo."""
-#     from llava.model.builder import load_pretrained_model
-#     from llava.mm_utils import get_model_name_from_path
-#     from llava.constants import IMAGE_TOKEN_INDEX
-
-#     model_name = get_model_name_from_path(model_path)
-#     tokenizer, model, image_processor, context_len = load_pretrained_model(
-#         model_path, None, model_name, device_map=device,
-#         torch_dtype=torch.float16
-#     )
-#     model.eval()
-#     return model, tokenizer, image_processor, IMAGE_TOKEN_INDEX
-
-
-# def load_model_hf(hf_id, device):
-#     """Load the HuggingFace LLaVA model."""
-#     from transformers import AutoProcessor, LlavaForConditionalGeneration
-
-#     processor = AutoProcessor.from_pretrained(hf_id)
-#     model = LlavaForConditionalGeneration.from_pretrained(
-#         hf_id, torch_dtype=torch.float16, low_cpu_mem_usage=True
-#     ).to(device).eval()
-#     image_token_id = model.config.image_token_index
-#     return model, processor, None, image_token_id
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 3 — Ablation hooks
-# # ═══════════════════════════════════════════════════════════════════
-
-# def make_ablation_hooks(model, model_type, ablate_indices, n_layers=32,
-#                         method='zero', neuron_stats=None, seed=42):
-#     """Register forward hooks that ablate specified neurons at act_fn output.
-
-#     Args:
-#         model: the LLaVA model
-#         model_type: 'hf' or 'liuhaotian'
-#         ablate_indices: dict {layer_idx: list of neuron indices to ablate}
-#         n_layers: total number of layers
-#         method: ablation strategy —
-#             'zero'       — set activations to 0 (default, most disruptive)
-#             'mean'       — replace with per-neuron mean from reference data
-#             'noise'      — replace with N(mean, std) random noise
-#             'clamp_high' — clamp to 95th-percentile value
-#             'clamp_low'  — clamp to 5th-percentile value
-#         neuron_stats: dict {layer_idx: {neuron_idx: {'mean': float,
-#             'std': float, 'p5': float, 'p95': float}}}
-#             Required for mean/noise/clamp methods. Obtained from
-#             collect_neuron_stats().
-#         seed: random seed for noise method
-
-#     Returns:
-#         list of hook handles (call .remove() to deregister)
-#     """
-#     handles = []
-#     rng = torch.Generator()
-#     rng.manual_seed(seed)
-
-#     for layer_idx, neuron_indices in ablate_indices.items():
-#         if not neuron_indices:
-#             continue
-
-#         indices_tensor = torch.tensor(neuron_indices, dtype=torch.long)
-
-#         # Pre-compute replacement values per neuron for this layer
-#         replacement_vals = None
-#         if method in ('mean', 'noise', 'clamp_high', 'clamp_low') and neuron_stats:
-#             layer_stats = neuron_stats.get(layer_idx, {})
-#             vals = []
-#             for nidx in neuron_indices:
-#                 ns = layer_stats.get(nidx, {'mean': 0.0, 'std': 1.0,
-#                                              'p5': 0.0, 'p95': 0.0})
-#                 if method == 'mean':
-#                     vals.append(ns['mean'])
-#                 elif method == 'clamp_high':
-#                     vals.append(ns['p95'])
-#                 elif method == 'clamp_low':
-#                     vals.append(ns['p5'])
-#                 else:  # noise — store mean and std for runtime sampling
-#                     vals.append((ns['mean'], ns['std']))
-#             if method != 'noise':
-#                 replacement_vals = torch.tensor(vals, dtype=torch.float16)
-
-#         # Get the act_fn module
-#         if model_type == 'hf':
-#             layer = model.language_model.model.layers[layer_idx]
-#         else:
-#             layer = model.model.layers[layer_idx]
-
-#         act_fn = layer.mlp.act_fn
-
-#         def hook_fn(module, input, output, _indices=indices_tensor,
-#                     _method=method, _repl=replacement_vals,
-#                     _noise_params=vals if method == 'noise' else None):
-#             device = output.device
-#             idx = _indices.to(device)
-
-#             if _method == 'zero':
-#                 # Set activations to exactly 0
-#                 output[:, :, idx] = 0.0
-
-#             elif _method in ('mean', 'clamp_high', 'clamp_low'):
-#                 # Replace with pre-computed constant per neuron
-#                 # _repl shape: (n_neurons,) → broadcast over (batch, seq)
-#                 output[:, :, idx] = _repl.to(device)
-
-#             elif _method == 'noise':
-#                 # Replace with Gaussian noise ~ N(mean, std) per neuron
-#                 for i, nidx in enumerate(idx):
-#                     mu, sigma = _noise_params[i]
-#                     noise = torch.randn(
-#                         output[:, :, nidx].shape,
-#                         device=device, dtype=output.dtype
-#                     ) * sigma + mu
-#                     output[:, :, nidx] = noise
-
-#             return output
-
-#         h = act_fn.register_forward_hook(hook_fn)
-#         handles.append(h)
-
-#     return handles
-
-
-# def build_ablation_indices(condition, neuron_indices_by_type, labels_by_layer,
-#                            seed=42, top_n=None, layer_range=None,
-#                            ranked_neurons=None):
-#     """Build the dict of {layer_idx: [neuron_indices]} for a given condition.
-
-#     Args:
-#         condition: one of 'baseline', 'ablate_text', 'ablate_vis',
-#                    'ablate_multi', 'random'
-#         neuron_indices_by_type: output of get_neuron_indices_by_type()
-#         labels_by_layer: output of load_neuron_labels()
-#         seed: random seed for 'random' condition
-#         top_n: if set, only ablate the top N most confident neurons
-#             of the target type (ranked by classification confidence).
-#             Requires ranked_neurons to be provided.
-#         layer_range: tuple (start, end) — only ablate neurons in
-#             layers[start:end+1]. None means all layers.
-#         ranked_neurons: output of get_ranked_neurons_by_type() —
-#             needed when top_n is set.
-
-#     Returns:
-#         dict {layer_idx: list of neuron indices to ablate}
-#     """
-#     if condition == 'baseline':
-#         return {}
-
-#     type_map = {
-#         'ablate_text': 'text',
-#         'ablate_vis': 'visual',
-#         'ablate_multi': 'multimodal',
-#     }
-
-#     if condition in type_map:
-#         target_type = type_map[condition]
-
-#         # ── Top-N mode: pick N most confident neurons globally ──
-#         if top_n is not None and ranked_neurons is not None:
-#             ranking = ranked_neurons.get(target_type, [])
-#             selected = ranking[:top_n]  # already sorted by confidence desc
-#             ablate = {}
-#             for lay, nidx, score in selected:
-#                 # Apply layer range filter
-#                 if layer_range and not (layer_range[0] <= lay <= layer_range[1]):
-#                     continue
-#                 ablate.setdefault(lay, []).append(nidx)
-#             return ablate
-
-#         # ── Full ablation (all neurons of this type) ──
-#         full = dict(neuron_indices_by_type.get(target_type, {}))
-#         if layer_range:
-#             return {l: v for l, v in full.items()
-#                     if layer_range[0] <= l <= layer_range[1]}
-#         return full
-
-#     if condition == 'random':
-#         # Match the size of the LARGEST targeted ablation in this run
-#         # (or text neurons if nothing else specified)
-#         rng = np.random.RandomState(seed)
-#         ablate = {}
-#         text_indices = neuron_indices_by_type.get('text', {})
-#         for layer_idx, labels in labels_by_layer.items():
-#             if layer_range and not (layer_range[0] <= layer_idx <= layer_range[1]):
-#                 continue
-#             n_to_ablate = len(text_indices.get(layer_idx, []))
-#             if top_n is not None:
-#                 # For top_n mode, match the total count across all layers
-#                 # We'll compute this below after the loop
-#                 pass
-#             if n_to_ablate > 0:
-#                 all_indices = list(range(len(labels)))
-#                 chosen = rng.choice(all_indices, size=min(n_to_ablate, len(all_indices)),
-#                                     replace=False).tolist()
-#                 ablate[layer_idx] = chosen
-
-#         # If top_n is set, adjust random count to match the targeted total
-#         if top_n is not None and ranked_neurons is not None:
-#             # Find how many neurons are actually ablated in the corresponding
-#             # targeted condition (use 'visual' as reference)
-#             ref_type = 'visual'
-#             ref_ranking = ranked_neurons.get(ref_type, [])
-#             ref_selected = ref_ranking[:top_n]
-#             if layer_range:
-#                 ref_selected = [(l, n, s) for l, n, s in ref_selected
-#                                 if layer_range[0] <= l <= layer_range[1]]
-#             target_total = len(ref_selected)
-
-#             # Redistribute randomly across layers
-#             rng2 = np.random.RandomState(seed)
-#             ablate = {}
-#             valid_layers = [l for l in labels_by_layer
-#                             if not layer_range or
-#                             (layer_range[0] <= l <= layer_range[1])]
-#             if valid_layers and target_total > 0:
-#                 n_per_layer = len(next(iter(labels_by_layer.values())))
-#                 total_pool = len(valid_layers) * n_per_layer
-#                 remaining = min(target_total, total_pool)
-#                 # Spread evenly then sample
-#                 per_layer = remaining // len(valid_layers)
-#                 extra = remaining % len(valid_layers)
-#                 for i, lay in enumerate(sorted(valid_layers)):
-#                     n_this = per_layer + (1 if i < extra else 0)
-#                     if n_this > 0:
-#                         all_idx = list(range(len(labels_by_layer[lay])))
-#                         chosen = rng2.choice(all_idx,
-#                                              size=min(n_this, len(all_idx)),
-#                                              replace=False).tolist()
-#                         ablate[lay] = chosen
-
-#         return ablate
-
-#     raise ValueError(f'Unknown condition: {condition}')
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 3b — Neuron statistics collection (for mean/noise/clamp)
-# # ═══════════════════════════════════════════════════════════════════
-
-# def collect_neuron_stats(model, model_type, tokenizer_or_processor,
-#                          image_processor, image_token_id,
-#                          img_dir, device, n_images=50, n_layers=32,
-#                          seed=42):
-#     """Run reference images through the model and collect activation stats.
-
-#     Records mean, std, 5th/95th percentile of each neuron's post-act_fn
-#     activation across all positions and images. These stats are used by
-#     mean/noise/clamp ablation methods.
-
-#     Args:
-#         model, model_type, tokenizer_or_processor, image_processor,
-#             image_token_id: model components (same as evaluation)
-#         img_dir: path to directory of reference images (COCO val)
-#         device: torch device string
-#         n_images: how many reference images to use (50 is sufficient)
-#         n_layers: number of LLM layers
-#         seed: for reproducible image sampling
-
-#     Returns:
-#         neuron_stats: dict {layer_idx: {neuron_idx: {
-#             'mean': float, 'std': float, 'p5': float, 'p95': float}}}
-#     """
-#     print(f'  Collecting neuron activation stats from {n_images} images ...')
-
-#     # Find reference images
-#     rng = np.random.RandomState(seed)
-#     img_files = sorted([f for f in os.listdir(img_dir)
-#                         if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
-#     if len(img_files) > n_images:
-#         img_files = rng.choice(img_files, size=n_images,
-#                                replace=False).tolist()
-
-#     # Register recording hooks on every layer's act_fn
-#     # Collect per-layer running statistics using Welford's algorithm
-#     # to avoid storing all activations in memory
-#     layer_accumulators = {}
-#     hooks = []
-
-#     for layer_idx in range(n_layers):
-#         if model_type == 'hf':
-#             layer = model.language_model.model.layers[layer_idx]
-#         else:
-#             layer = model.model.layers[layer_idx]
-
-#         act_fn = layer.mlp.act_fn
-
-#         # Each accumulator tracks: count, mean, M2, min-heap, max-heap
-#         acc = {
-#             'count': 0,
-#             'mean': None,
-#             'M2': None,
-#             'all_vals': [],  # store a subsample for percentiles
-#         }
-#         layer_accumulators[layer_idx] = acc
-
-#         def make_hook(acc_ref, lidx):
-#             def hook_fn(module, input, output):
-#                 # output: (batch, seq_len, n_neurons)
-#                 # Average over batch and seq dimensions
-#                 vals = output.detach().float()
-#                 # Mean over batch and sequence → (n_neurons,)
-#                 batch_mean = vals.mean(dim=(0, 1)).cpu().numpy()
-
-#                 if acc_ref['mean'] is None:
-#                     acc_ref['mean'] = np.zeros_like(batch_mean)
-#                     acc_ref['M2'] = np.zeros_like(batch_mean)
-
-#                 acc_ref['count'] += 1
-#                 delta = batch_mean - acc_ref['mean']
-#                 acc_ref['mean'] += delta / acc_ref['count']
-#                 delta2 = batch_mean - acc_ref['mean']
-#                 acc_ref['M2'] += delta * delta2
-
-#                 # Store subsample for percentile estimation (first 20 images)
-#                 if acc_ref['count'] <= 20:
-#                     acc_ref['all_vals'].append(batch_mean.copy())
-
-#             return hook_fn
-
-#         h = act_fn.register_forward_hook(make_hook(acc, layer_idx))
-#         hooks.append(h)
-
-#     # Run forward passes
-#     prompt = "Describe this image briefly."
-#     for img_file in tqdm(img_files, desc='Stats collection'):
-#         img_path = os.path.join(img_dir, img_file)
-#         try:
-#             img = Image.open(img_path).convert('RGB')
-#         except Exception:
-#             continue
-
-#         # Simple forward pass (just generation of a few tokens)
-#         generate_answer(model, model_type, tokenizer_or_processor,
-#                         image_processor, image_token_id,
-#                         img, prompt, device, max_new_tokens=5)
-
-#     # Remove recording hooks
-#     for h in hooks:
-#         h.remove()
-
-#     # Build stats dict
-#     neuron_stats = {}
-#     for layer_idx, acc in layer_accumulators.items():
-#         if acc['mean'] is None or acc['count'] < 2:
-#             continue
-
-#         variance = acc['M2'] / max(acc['count'] - 1, 1)
-#         std = np.sqrt(np.maximum(variance, 0.0))
-
-#         # Compute percentiles from subsample
-#         if acc['all_vals']:
-#             stacked = np.stack(acc['all_vals'])  # (n_samples, n_neurons)
-#             p5 = np.percentile(stacked, 5, axis=0)
-#             p95 = np.percentile(stacked, 95, axis=0)
-#         else:
-#             p5 = acc['mean'] - 1.645 * std
-#             p95 = acc['mean'] + 1.645 * std
-
-#         layer_stats = {}
-#         n_neurons = len(acc['mean'])
-#         for nidx in range(n_neurons):
-#             layer_stats[nidx] = {
-#                 'mean': float(acc['mean'][nidx]),
-#                 'std': float(std[nidx]),
-#                 'p5': float(p5[nidx]),
-#                 'p95': float(p95[nidx]),
-#             }
-#         neuron_stats[layer_idx] = layer_stats
-
-#     print(f'  Collected stats for {len(neuron_stats)} layers '
-#           f'({acc["count"]} images processed)')
-#     return neuron_stats
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 4 — POPE evaluation
-# # ═══════════════════════════════════════════════════════════════════
-
-# def load_pope_questions(pope_path, num_questions=None):
-#     """Load POPE questions from JSONL file.
-
-#     Returns list of dicts with keys: question_id, image, text, label
-#     """
-#     questions = []
-#     with open(pope_path) as f:
-#         for line in f:
-#             line = line.strip()
-#             if not line:
-#                 continue
-#             q = json.loads(line)
-#             questions.append(q)
-#     if num_questions is not None and num_questions < len(questions):
-#         questions = questions[:num_questions]
-#     return questions
-
-
-# def evaluate_pope(model, model_type, tokenizer_or_processor, image_processor,
-#                   image_token_id, questions, img_dir, device):
-#     """Run POPE evaluation: ask yes/no questions, measure accuracy + F1.
-
-#     Returns dict with accuracy, precision, recall, f1, yes_ratio, n_questions.
-#     """
-#     correct = 0
-#     tp = fp = fn = tn = 0
-#     total = 0
-#     n_yes_pred = 0
-
-#     for q in tqdm(questions, desc='POPE eval'):
-#         img_path = os.path.join(img_dir, q['image'])
-#         if not os.path.isfile(img_path):
-#             continue
-
-#         try:
-#             img = Image.open(img_path).convert('RGB')
-#         except Exception:
-#             continue
-
-#         question_text = q['text']
-#         gt_label = q['label'].strip().lower()
-
-#         # Generate answer (POPE is yes/no, so 10 tokens is plenty)
-#         answer = generate_answer(model, model_type, tokenizer_or_processor,
-#                                  image_processor, image_token_id,
-#                                  img, question_text, device,
-#                                  max_new_tokens=10)
-#         answer_lower = answer.strip().lower()
-
-#         # Parse yes/no
-#         pred_yes = answer_lower.startswith('yes')
-#         gt_yes = gt_label == 'yes'
-
-#         if pred_yes == gt_yes:
-#             correct += 1
-#         if pred_yes and gt_yes:
-#             tp += 1
-#         elif pred_yes and not gt_yes:
-#             fp += 1
-#         elif not pred_yes and gt_yes:
-#             fn += 1
-#         else:
-#             tn += 1
-
-#         if pred_yes:
-#             n_yes_pred += 1
-#         total += 1
-
-#     accuracy = correct / max(total, 1)
-#     precision = tp / max(tp + fp, 1)
-#     recall = tp / max(tp + fn, 1)
-#     f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-#     yes_ratio = n_yes_pred / max(total, 1)
-
-#     return {
-#         'accuracy': round(accuracy, 4),
-#         'precision': round(precision, 4),
-#         'recall': round(recall, 4),
-#         'f1': round(f1, 4),
-#         'yes_ratio': round(yes_ratio, 4),
-#         'n_questions': total,
-#         'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
-#     }
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 5 — CHAIR evaluation
-# # ═══════════════════════════════════════════════════════════════════
-
-# def load_coco_objects(ann_path):
-#     """Load COCO instance annotations → {image_id: set of category names}."""
-#     with open(ann_path) as f:
-#         data = json.load(f)
-#     cat_id_to_name = {c['id']: c['name'] for c in data['categories']}
-#     image_objects = {}
-#     for ann in data['annotations']:
-#         img_id = ann['image_id']
-#         cat_name = cat_id_to_name[ann['category_id']]
-#         image_objects.setdefault(img_id, set()).add(cat_name.lower())
-#     return image_objects, cat_id_to_name
-
-
-# def evaluate_chair(model, model_type, tokenizer_or_processor, image_processor,
-#                    image_token_id, ann_path, img_dir, device,
-#                    num_images=500, seed=42):
-#     """Run CHAIR evaluation: generate captions, measure object hallucination.
-
-#     CHAIR_i = hallucinated objects / total mentioned objects
-#     CHAIR_s = sentences with hallucination / total sentences
-
-#     Returns dict with chair_i, chair_s, n_images, avg_caption_len.
-#     """
-#     image_objects, cat_id_to_name = load_coco_objects(ann_path)
-#     all_cat_names = set(n.lower() for n in cat_id_to_name.values())
-
-#     # Get image filenames
-#     with open(ann_path) as f:
-#         data = json.load(f)
-#     id_to_filename = {img['id']: img['file_name'] for img in data['images']}
-
-#     # Sample images that have annotations
-#     rng = np.random.RandomState(seed)
-#     valid_ids = [iid for iid in image_objects if iid in id_to_filename]
-#     if num_images < len(valid_ids):
-#         chosen_ids = rng.choice(valid_ids, size=num_images, replace=False).tolist()
-#     else:
-#         chosen_ids = valid_ids
-
-#     total_objects_mentioned = 0
-#     total_hallucinated = 0
-#     total_sentences = 0
-#     sentences_with_hallucination = 0
-#     total_caption_len = 0
-
-#     for img_id in tqdm(chosen_ids, desc='CHAIR eval'):
-#         filename = id_to_filename[img_id]
-#         img_path = os.path.join(img_dir, filename)
-#         if not os.path.isfile(img_path):
-#             continue
-
-#         try:
-#             img = Image.open(img_path).convert('RGB')
-#         except Exception:
-#             continue
-
-#         # Generate caption (100 tokens is plenty for a description)
-#         caption = generate_answer(model, model_type, tokenizer_or_processor,
-#                                   image_processor, image_token_id,
-#                                   img, "Could you describe the image?", device,
-#                                   max_new_tokens=100)
-
-#         gt_objects = image_objects.get(img_id, set())
-#         total_caption_len += len(caption.split())
-
-#         # Check each sentence for hallucinated objects
-#         sentences = [s.strip() for s in caption.replace('\n', '.').split('.')
-#                      if s.strip()]
-#         for sentence in sentences:
-#             sentence_lower = sentence.lower()
-#             total_sentences += 1
-#             sentence_has_hallucination = False
-
-#             for cat_name in all_cat_names:
-#                 if cat_name in sentence_lower:
-#                     total_objects_mentioned += 1
-#                     if cat_name not in gt_objects:
-#                         total_hallucinated += 1
-#                         sentence_has_hallucination = True
-
-#             if sentence_has_hallucination:
-#                 sentences_with_hallucination += 1
-
-#     chair_i = total_hallucinated / max(total_objects_mentioned, 1)
-#     chair_s = sentences_with_hallucination / max(total_sentences, 1)
-#     avg_len = total_caption_len / max(len(chosen_ids), 1)
-
-#     return {
-#         'chair_i': round(chair_i, 4),
-#         'chair_s': round(chair_s, 4),
-#         'n_images': len(chosen_ids),
-#         'total_objects_mentioned': total_objects_mentioned,
-#         'total_hallucinated': total_hallucinated,
-#         'total_sentences': total_sentences,
-#         'sentences_with_hallucination': sentences_with_hallucination,
-#         'avg_caption_len': round(avg_len, 1),
-#     }
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 6 — Generation helper
-# # ═══════════════════════════════════════════════════════════════════
-
-# def generate_answer(model, model_type, tokenizer_or_processor, image_processor,
-#                     image_token_id, img, question, device, max_new_tokens=512):
-#     """Generate a text answer for an image + question.
-
-#     Handles both HF and original LLaVA backends.
-#     """
-#     with torch.no_grad():
-#         if model_type == 'hf':
-#             prompt = f"USER: <image>\n{question}\nASSISTANT:"
-#             inputs = tokenizer_or_processor(
-#                 images=img, text=prompt, return_tensors='pt'
-#             ).to(device)
-#             output_ids = model.generate(
-#                 **inputs,
-#                 max_new_tokens=max_new_tokens,
-#                 do_sample=False,
-#             )
-#             # Decode only the generated tokens (skip the prompt)
-#             prompt_len = inputs['input_ids'].shape[1]
-#             answer = tokenizer_or_processor.decode(
-#                 output_ids[0][prompt_len:], skip_special_tokens=True)
-#         else:
-#             from llava.conversation import conv_templates
-#             from llava.constants import IMAGE_TOKEN_INDEX
-#             from llava.mm_utils import tokenizer_image_token
-
-#             conv = conv_templates["v1"].copy()
-#             conv.append_message(conv.roles[0], f"<image>\n{question}")
-#             conv.append_message(conv.roles[1], None)
-#             prompt = conv.get_prompt()
-
-#             input_ids = tokenizer_image_token(
-#                 prompt, tokenizer_or_processor, IMAGE_TOKEN_INDEX,
-#                 return_tensors='pt'
-#             ).unsqueeze(0).to(device)
-
-#             image_tensor = image_processor.preprocess(
-#                 img, return_tensors='pt'
-#             )['pixel_values'].half().to(device)
-
-#             output_ids = model.generate(
-#                 input_ids,
-#                 images=image_tensor,
-#                 max_new_tokens=max_new_tokens,
-#                 do_sample=False,
-#             )
-#             answer = tokenizer_or_processor.decode(
-#                 output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
-
-#     return answer.strip()
-
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 7 — Argument parsing
-# # ═══════════════════════════════════════════════════════════════════
-
-# def parse_args():
-#     p = argparse.ArgumentParser(
-#         description='Ablation validation of neuron taxonomy')
-
-#     # Model
-#     p.add_argument('--model_type', default='liuhaotian',
-#                    choices=['hf', 'liuhaotian'])
-#     p.add_argument('--original_model_path', default='liuhaotian/llava-v1.5-7b')
-#     p.add_argument('--hf_id', default='llava-hf/llava-1.5-7b-hf')
-
-#     # Labels
-#     p.add_argument('--labels_dir', required=False,
-#                    help='Directory with permutation-test neuron labels')
-
-#     # Output
-#     p.add_argument('--output_dir', default='results/ablation')
-
-#     # Ablation conditions
-#     p.add_argument('--conditions', nargs='+',
-#                    default=['baseline', 'ablate_text', 'ablate_vis',
-#                             'ablate_multi', 'random'],
-#                    help='Ablation conditions to run')
-#     p.add_argument('--num_images', type=int, default=100,
-#                    help='Number of images for evaluation')
-
-#     # POPE
-#     p.add_argument('--pope_path', default=None,
-#                    help='Path to POPE JSONL file')
-#     p.add_argument('--pope_img_dir', default=None,
-#                    help='Path to COCO val images for POPE')
-#     p.add_argument('--pope_num_questions', type=int, default=None,
-#                    help='Limit number of POPE questions (for testing)')
-
-#     # CHAIR
-#     p.add_argument('--chair_ann_path', default=None,
-#                    help='Path to instances_val2014.json for CHAIR')
-#     p.add_argument('--chair_img_dir', default=None,
-#                    help='Path to COCO val images for CHAIR')
-#     p.add_argument('--chair_num_images', type=int, default=500)
-
-
-
-#     # Device
-#     p.add_argument('--device', default='0')
-#     p.add_argument('--seed', type=int, default=42)
-#     p.add_argument('--label_source', default='llm_permutation',
-#                    choices=['llm_permutation', 'xu', 'llm_pmbt'],
-#                    help='Which labels to use: permutation, xu (fixed-threshold), '
-#                         'or pmbt (Population-Median Binomial Test)')
-
-#     # ── Advanced ablation options (8 approaches) ──
-#     p.add_argument('--ablation_method', default='zero',
-#                    choices=['zero', 'mean', 'noise', 'clamp_high', 'clamp_low'],
-#                    help='How to ablate neurons: zero (set to 0), mean (replace '
-#                         'with dataset mean), noise (Gaussian noise matching '
-#                         'neuron stats), clamp_high (set to 95th percentile), '
-#                         'clamp_low (set to 5th percentile)')
-#     p.add_argument('--top_n', type=int, default=None,
-#                    help='Ablate only the top N most confident neurons per type '
-#                         '(for start-small-scale-up / ablation curve)')
-#     p.add_argument('--layer_range', default=None,
-#                    help='Only ablate neurons in this layer range, e.g. "0-10" '
-#                         'or "22-31" (for layer-specific ablation)')
-#     p.add_argument('--curve', action='store_true',
-#                    help='Run full ablation curve: sweep top_n over multiple '
-#                         'values (100,500,1000,5000,all) for each condition')
-#     p.add_argument('--curve_steps', default='100,500,1000,5000',
-#                    help='Comma-separated top_n values for --curve sweep '
-#                         '(default: 100,500,1000,5000)')
-#     p.add_argument('--n_stats_images', type=int, default=50,
-#                    help='Number of reference images for computing neuron '
-#                         'activation stats (mean/noise/clamp methods)')
-#     p.add_argument('--ranking_method', default='label',
-#                    choices=['label', 'cett'],
-#                    help='How to rank neurons for top_n / curve selection: '
-#                         '"label" uses classification confidence (1-p_value or '
-#                         'class probability), "cett" uses total CETT = '
-#                         'mean_activation × ||down_proj column||, ranking by '
-#                         'actual impact on layer output')
-#     p.add_argument('--n_cett_images', type=int, default=30,
-#                    help='Number of reference images for CETT computation')
-
-#     # Merge mode
-#     p.add_argument('--merge', action='store_true',
-#                    help='Merge per-condition results into summary, then exit')
-
-#     return p.parse_args()
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 8 — Merge
-# # ═══════════════════════════════════════════════════════════════════
-
-# def merge_results(args):
-#     """Merge per-condition ablation results into a single summary."""
-#     output_dir = args.output_dir
-#     condition_files = sorted(glob.glob(
-#         os.path.join(output_dir, 'ablation_condition_*.json')))
-
-#     if not condition_files:
-#         print(f'No condition files found in {output_dir}')
-#         return
-
-#     summary = {'conditions': {}}
-#     for f_path in condition_files:
-#         with open(f_path) as f:
-#             data = json.load(f)
-#         cond_name = data.get('condition', os.path.basename(f_path))
-#         summary['conditions'][cond_name] = data
-
-#     # Compute deltas vs baseline
-#     baseline = summary['conditions'].get('baseline', {})
-#     if baseline:
-#         for cond_name, cond_data in summary['conditions'].items():
-#             if cond_name == 'baseline':
-#                 continue
-#             deltas = {}
-#             if 'pope' in baseline and 'pope' in cond_data:
-#                 deltas['pope_accuracy_delta'] = round(
-#                     cond_data['pope']['accuracy'] - baseline['pope']['accuracy'], 4)
-#                 deltas['pope_f1_delta'] = round(
-#                     cond_data['pope']['f1'] - baseline['pope']['f1'], 4)
-#             if 'chair' in baseline and 'chair' in cond_data:
-#                 deltas['chair_i_delta'] = round(
-#                     cond_data['chair']['chair_i'] - baseline['chair']['chair_i'], 4)
-#                 deltas['chair_s_delta'] = round(
-#                     cond_data['chair']['chair_s'] - baseline['chair']['chair_s'], 4)
-#             cond_data['deltas_vs_baseline'] = deltas
-
-#     summary_path = os.path.join(output_dir, 'ablation_summary.json')
-#     with open(summary_path, 'w') as f:
-#         json.dump(summary, f, indent=2)
-
-#     print(f'\nAblation Summary')
-#     print(f'{"="*60}')
-#     for cond_name, cond_data in summary['conditions'].items():
-#         print(f'\n  {cond_name}:')
-#         n_abl = cond_data.get("n_neurons_ablated", 0)
-#         pct = cond_data.get("pct_neurons_ablated", "?")
-#         method = cond_data.get("ablation_method", "zero")
-#         top_n = cond_data.get("top_n", None)
-#         lr = cond_data.get("layer_range", None)
-#         print(f'    Neurons ablated: {n_abl} ({pct}%)  '
-#               f'method={method}  top_n={top_n}  layers={lr}')
-#         if 'pope' in cond_data:
-#             pope = cond_data['pope']
-#             print(f'    POPE accuracy: {pope["accuracy"]:.4f}  F1: {pope["f1"]:.4f}')
-#         if 'chair' in cond_data:
-#             chair = cond_data['chair']
-#             print(f'    CHAIR_i: {chair["chair_i"]:.4f}  CHAIR_s: {chair["chair_s"]:.4f}')
-#         if 'deltas_vs_baseline' in cond_data:
-#             d = cond_data['deltas_vs_baseline']
-#             parts = []
-#             for k, v in d.items():
-#                 parts.append(f'{k}={v:+.4f}')
-#             if parts:
-#                 print(f'    Δ vs baseline: {", ".join(parts)}')
-
-#     print(f'\nSaved → {summary_path}')
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 9 — Main
-# # ═══════════════════════════════════════════════════════════════════
-
-# def main():
-#     args = parse_args()
-
-#     if args.merge:
-#         merge_results(args)
-#         return
-
-#     device = f'cuda:{args.device}' if args.device.isdigit() else args.device
-#     os.makedirs(args.output_dir, exist_ok=True)
-
-#     # ── Parse layer range ──
-#     layer_range = None
-#     if args.layer_range:
-#         parts = args.layer_range.split('-')
-#         layer_range = (int(parts[0]), int(parts[1]))
-#         print(f'Layer range filter: layers {layer_range[0]}–{layer_range[1]}')
-
-#     # ── Load neuron labels (with raw data for confidence ranking) ──
-#     print(f'Loading neuron labels from {args.labels_dir} ...')
-#     print(f'  Label source: {args.label_source}')
-#     labels_by_layer, raw_by_layer = load_neuron_labels(
-#         args.labels_dir, args.model_type,
-#         label_source=args.label_source)
-#     if not labels_by_layer:
-#         print(f'ERROR: No neuron labels found in {args.labels_dir}')
-#         sys.exit(1)
-
-#     n_layers_found = len(labels_by_layer)
-#     n_neurons_per_layer = len(next(iter(labels_by_layer.values())))
-#     print(f'  Loaded labels for {n_layers_found} layers, '
-#           f'{n_neurons_per_layer} neurons/layer')
-
-#     neuron_indices_by_type = get_neuron_indices_by_type(labels_by_layer)
-#     for label_type, layer_dict in neuron_indices_by_type.items():
-#         total = sum(len(v) for v in layer_dict.values())
-#         print(f'  {label_type:12s}: {total:6d} neurons across {len(layer_dict)} layers')
-
-#     # ── Build confidence rankings (for top_n / curve) ──
-#     ranked_neurons = get_ranked_neurons_by_type(
-#         raw_by_layer, args.label_source)
-#     for label_type, ranking in ranked_neurons.items():
-#         if ranking:
-#             top_score = ranking[0][2]
-#             bot_score = ranking[-1][2]
-#             print(f'  {label_type:12s} confidence: '
-#                   f'top={top_score:.4f}  bottom={bot_score:.4f}')
-
-#     # ── Load model ──
-#     print(f'\nLoading model ({args.model_type}) ...')
-#     if args.model_type == 'hf':
-#         model, processor, image_processor, image_token_id = load_model_hf(
-#             args.hf_id, device)
-#         tokenizer_or_processor = processor
-#     else:
-#         model, tokenizer, image_processor, image_token_id = load_model_original(
-#             args.original_model_path, device)
-#         tokenizer_or_processor = tokenizer
-#     print('  Model loaded.')
-
-#     # ── Compute CETT rankings (if requested) ──
-#     cett_scores = None
-#     if args.ranking_method == 'cett':
-#         cett_img_dir = args.pope_img_dir or args.chair_img_dir
-#         if cett_img_dir:
-#             cett_ranked, cett_scores = compute_cett_rankings(
-#                 model, args.model_type, tokenizer_or_processor,
-#                 image_processor, image_token_id,
-#                 cett_img_dir, labels_by_layer, device,
-#                 n_images=args.n_cett_images, seed=args.seed)
-
-#             # Override the label-based rankings with CETT-based rankings
-#             ranked_neurons = cett_ranked
-#             print(f'  Using CETT rankings (overriding label confidence)')
-
-#             # Save CETT scores for analysis
-#             cett_path = os.path.join(args.output_dir, 'cett_scores.json')
-#             cett_serializable = {
-#                 str(l): {str(n): float(v) for n, v in enumerate(scores)}
-#                 for l, scores in cett_scores.items()
-#             }
-#             with open(cett_path, 'w') as f:
-#                 json.dump(cett_serializable, f, indent=2)
-#             print(f'  Saved CETT scores → {cett_path}')
-#         else:
-#             print('  WARNING: No image dir for CETT computation. '
-#                   'Falling back to label-based ranking.')
-#             args.ranking_method = 'label'
-
-#     # ── Collect neuron stats (needed for mean/noise/clamp methods) ──
-#     neuron_stats = None
-#     if args.ablation_method != 'zero':
-#         stats_img_dir = args.pope_img_dir or args.chair_img_dir
-#         if stats_img_dir:
-#             neuron_stats = collect_neuron_stats(
-#                 model, args.model_type, tokenizer_or_processor,
-#                 image_processor, image_token_id,
-#                 stats_img_dir, device,
-#                 n_images=args.n_stats_images, seed=args.seed)
-#         else:
-#             print('  WARNING: No image dir available for stats collection. '
-#                   'Falling back to zero ablation for mean/noise/clamp.')
-#             args.ablation_method = 'zero'
-
-#     # ── Load POPE questions ──
-#     pope_questions = None
-#     if args.pope_path and os.path.isfile(args.pope_path):
-#         print(f'\nLoading POPE questions from {args.pope_path} ...')
-#         pope_questions = load_pope_questions(args.pope_path, args.pope_num_questions)
-#         print(f'  Loaded {len(pope_questions)} questions')
-
-#     # ── Build list of (condition, top_n) runs ──
-#     # In curve mode, we sweep top_n for each condition
-#     if args.curve:
-#         curve_steps = [int(x) for x in args.curve_steps.split(',')]
-#         # Add 'all' (None) as the final step
-#         top_n_values = curve_steps + [None]
-#         print(f'\n  Curve mode: sweeping top_n = '
-#               f'{[str(x) for x in curve_steps]} + [all]')
-#     elif args.top_n is not None:
-#         top_n_values = [args.top_n]
-#     else:
-#         top_n_values = [None]  # None = ablate all neurons of the type
-
-#     # ── Run each (condition × top_n) combination ──
-#     for condition in args.conditions:
-#         for top_n in top_n_values:
-#             # Build a descriptive run name
-#             run_name = condition
-#             if top_n is not None:
-#                 run_name = f'{condition}_top{top_n}'
-#             if layer_range:
-#                 run_name = f'{run_name}_L{layer_range[0]}-{layer_range[1]}'
-#             if args.ablation_method != 'zero':
-#                 run_name = f'{run_name}_{args.ablation_method}'
-
-#             print(f'\n{"="*60}')
-#             print(f'CONDITION: {run_name}')
-#             print(f'{"="*60}')
-
-#             # Check if already done
-#             marker_path = os.path.join(args.output_dir,
-#                                        f'ablation_condition_{run_name}.json')
-#             if os.path.isfile(marker_path):
-#                 print(f'  [skip] Already complete — {marker_path}')
-#                 continue
-
-#             # Build ablation indices
-#             ablate_indices = build_ablation_indices(
-#                 condition, neuron_indices_by_type, labels_by_layer,
-#                 args.seed, top_n=top_n, layer_range=layer_range,
-#                 ranked_neurons=ranked_neurons)
-#             n_ablated = sum(len(v) for v in ablate_indices.values())
-#             n_layers_ablated = len(ablate_indices)
-#             pct = 100 * n_ablated / (n_layers_found * n_neurons_per_layer)
-#             print(f'  Ablating {n_ablated} neurons ({pct:.1f}%) '
-#                   f'across {n_layers_ablated} layers '
-#                   f'[method={args.ablation_method}]')
-
-#             # Register hooks
-#             handles = make_ablation_hooks(
-#                 model, args.model_type, ablate_indices,
-#                 method=args.ablation_method,
-#                 neuron_stats=neuron_stats, seed=args.seed)
-#             print(f'  Registered {len(handles)} ablation hooks')
-
-#             result = {
-#                 'condition': run_name,
-#                 'base_condition': condition,
-#                 'ablation_method': args.ablation_method,
-#                 'ranking_method': args.ranking_method,
-#                 'top_n': top_n,
-#                 'layer_range': list(layer_range) if layer_range else None,
-#                 'n_neurons_ablated': n_ablated,
-#                 'n_layers_ablated': n_layers_ablated,
-#                 'pct_neurons_ablated': round(pct, 2),
-#             }
-
-#             t0 = time.time()
-
-#             # POPE evaluation
-#             if pope_questions and args.pope_img_dir:
-#                 print(f'\n  Running POPE evaluation ({len(pope_questions)} questions) ...')
-#                 pope_result = evaluate_pope(
-#                     model, args.model_type, tokenizer_or_processor,
-#                     image_processor, image_token_id,
-#                     pope_questions, args.pope_img_dir, device)
-#                 result['pope'] = pope_result
-#                 print(f'  POPE: accuracy={pope_result["accuracy"]:.4f}  '
-#                       f'F1={pope_result["f1"]:.4f}  '
-#                       f'yes_ratio={pope_result["yes_ratio"]:.4f}')
-
-#             # CHAIR evaluation
-#             if args.chair_ann_path and args.chair_img_dir:
-#                 print(f'\n  Running CHAIR evaluation ({args.chair_num_images} images) ...')
-#                 chair_result = evaluate_chair(
-#                     model, args.model_type, tokenizer_or_processor,
-#                     image_processor, image_token_id,
-#                     args.chair_ann_path, args.chair_img_dir, device,
-#                     num_images=args.chair_num_images, seed=args.seed)
-#                 result['chair'] = chair_result
-#                 print(f'  CHAIR_i={chair_result["chair_i"]:.4f}  '
-#                       f'CHAIR_s={chair_result["chair_s"]:.4f}')
-
-#             elapsed = time.time() - t0
-#             result['time_sec'] = round(elapsed, 1)
-
-#             # Remove hooks
-#             for h in handles:
-#                 h.remove()
-
-#             # Save per-condition result
-#             with open(marker_path, 'w') as f:
-#                 json.dump(result, f, indent=2)
-#             print(f'\n  Saved → {marker_path} ({elapsed:.1f}s)')
-
-#     # ── Auto-merge if all conditions ran in this process ──
-#     print(f'\n{"="*60}')
-#     print('Merging all condition results ...')
-#     merge_results(args)
-
-
-# if __name__ == '__main__':
-#     main()
-
-
-
-
-# #!/usr/bin/env python3
-# """
-# neuron_ablation_validate.py — Ablation validation of neuron taxonomy
-
-# Validates the neuron classification (visual / text / multimodal / unknown)
-# by selectively ablating neurons of each type and measuring
-# the impact on downstream tasks:
-
-#   - POPE: Polling-based Object Probing Evaluation (yes/no accuracy + F1)
-#   - CHAIR: Caption Hallucination Assessment with Image Relevance
-
-# Implements 7 ablation approaches:
-
-#   1. Ablation curve (--curve)
-#      Sweep top_n = 100, 500, 1000, 5000, all neurons per type.
-#      Shows whether a small set suffices or whether effect is distributed.
-
-#   2. Layer-specific ablation (--layer_range 0-10)
-#      Restrict ablation to a subset of layers to find where each
-#      modality's neurons are most functionally important.
-
-#   3. Mean ablation (--ablation_method mean)
-#      Replace with per-neuron mean activation instead of zeroing.
-#      Less disruptive — tests whether input-specific signal matters.
-
-#   4. Noise ablation (--ablation_method noise)
-#      Replace with N(mean, std) Gaussian noise per neuron.
-#      Tests whether the neuron's specific signal matters vs any signal.
-#      NOTE: Noise ablation can cause the model to generate endlessly when
-#      activations are corrupted, leading to very long runtimes or timeouts.
-#      Consider adding a max_new_tokens cap to keep generation bounded.
-
-#   5. Activation clamping (--ablation_method clamp_high / clamp_low)
-#      Set to 95th or 5th percentile. Tests direction of effect.
-
-#   6. Neuron count matching (built into 'random' condition)
-#      Random baseline always matches the targeted ablation count.
-#      Controlled automatically when using --top_n or --curve.
-
-#   7. Start small, scale up (--top_n 100 / --top_n 500 / --top_n 1000)
-#      Rank neurons by classification confidence, ablate only the most
-#      confident ones first. Equivalent to specific points on the curve.
-
-#   8. CETT ranking (--ranking_method cett)
-#      Ranks neurons by their actual impact on the layer output,
-#      not just activation magnitude. For each neuron:
-#      total_cett_j = mean_activation_j × ||down_proj[:, j]||
-#      A neuron with high activation but tiny down_proj column has
-#      low CETT (fires hard but the model ignores it). Same metric
-#      for all neuron types — labels handle grouping, CETT handles
-#      ordering within each group. Ablating higher-CETT neurons
-#      first causes more disruption per neuron removed.
-
-# Conditions:
-#   baseline     — no ablation (original model)
-#   ablate_text  — ablate text-classified neurons
-#   ablate_vis   — ablate visual-classified neurons
-#   ablate_multi — ablate multimodal-classified neurons
-#   random       — ablate a random subset (matched count)
-
-# Usage examples:
-#     # Basic: all neurons, zero ablation
-#     python neuron_ablation_validate.py --conditions baseline ablate_vis random
-
-#     # Ablation curve: sweep top_n for visual neurons
-#     python neuron_ablation_validate.py --curve \\
-#         --conditions baseline ablate_vis random
-
-#     # Top-100 most confident visual neurons with mean ablation
-#     python neuron_ablation_validate.py --top_n 100 \\
-#         --ablation_method mean --conditions baseline ablate_vis random
-
-#     # Layer-specific: only layers 0-10
-#     python neuron_ablation_validate.py --layer_range 0-10 \\
-#         --conditions baseline ablate_vis ablate_text random
-
-#     # CETT ranking with ablation curve
-#     python neuron_ablation_validate.py --curve --ranking_method cett \\
-#         --conditions baseline ablate_vis random
-
-#     # Merge per-condition results:
-#     python neuron_ablation_validate.py --merge --output_dir results/ablation/
-# """
-
-# import argparse
-# import csv
-# import json
-# import glob
-# import os
-# import re
-# import string
-# import sys
-# import time
-
-# # Add LLaVA repo to path (needed for original model backend)
-# _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-# _LLAVA_PATH = os.path.join(_PROJECT_ROOT, 'LLaVA')
-# if _LLAVA_PATH not in sys.path:
-#     sys.path.insert(0, _LLAVA_PATH)
-
-# import numpy as np
-# import torch
-# from PIL import Image
-# from tqdm import tqdm
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 1 — Label loading
-# # ═══════════════════════════════════════════════════════════════════
-
-# def load_neuron_labels(labels_dir, model_type='liuhaotian', n_layers=32,
-#                        label_source='llm_permutation'):
-#     """Load per-layer neuron labels from the classification output.
-
-#     Args:
-#         labels_dir: path to permutation/ or fixed_threshold/ dir
-#         model_type: 'hf' or 'liuhaotian' — determines layer name prefix
-#         n_layers: total number of LLM layers (32 for LLaVA-7B)
-#         label_source: 'llm_permutation' or 'xu' — selects label filename
-
-#     Returns:
-#         labels_by_layer: dict {layer_idx: list of label strings}
-#         raw_by_layer: dict {layer_idx: list of full neuron dicts}
-#             Each dict has keys like neuron_idx, label, and confidence
-#             fields (pv/pt/pm/pu for xu; p_value/observed_rate_diff
-#             for permutation).
-#     """
-#     if model_type in ('hf',):
-#         prefix = 'model.language_model.layers'
-#     else:
-#         prefix = 'model.layers'
-
-#     # Select label filename based on source method
-#     if label_source == 'llm_permutation':
-#         label_filename = 'neuron_labels_permutation.json'
-#     elif label_source == 'llm_pmbt':
-#         label_filename = 'neuron_labels_pmbt.json'           # PMBT (Population-Median Binomial Test)
-#     else:
-#         label_filename = 'neuron_labels.json'
-
-#     labels_by_layer = {}
-#     raw_by_layer = {}
-#     for layer_idx in range(n_layers):
-#         layer_name = f'{prefix}.{layer_idx}.mlp.act_fn'
-#         label_path = os.path.join(labels_dir, layer_name, label_filename)
-#         if not os.path.isfile(label_path):
-#             continue
-#         with open(label_path) as f:
-#             neuron_data = json.load(f)
-#         labels_by_layer[layer_idx] = [n['label'] for n in neuron_data]
-#         raw_by_layer[layer_idx] = neuron_data
-
-#     return labels_by_layer, raw_by_layer
-
-
-# def get_neuron_indices_by_type(labels_by_layer):
-#     """Group neuron indices by their classification label.
-
-#     Returns:
-#         by_type: dict {label: dict {layer_idx: list of neuron indices}}
-#     """
-#     by_type = {'visual': {}, 'text': {}, 'multimodal': {}, 'unknown': {}}
-#     for layer_idx, labels in labels_by_layer.items():
-#         for label_type in by_type:
-#             indices = [i for i, l in enumerate(labels) if l == label_type]
-#             if indices:
-#                 by_type[label_type][layer_idx] = indices
-#     return by_type
-
-
-# def get_confidence_score(neuron_dict, label_source='llm_permutation'):
-#     """Extract a confidence score from a neuron's raw data dict.
-
-#     For permutation labels: confidence = 1 - p_value (lower p → more
-#     confident). Tie-break by |observed_rate_diff|.
-#     For xu (fixed-threshold) labels: confidence = probability of the
-#     assigned label (pv for visual, pt for text, pm for multimodal).
-
-#     Args:
-#         neuron_dict: single neuron dict from raw_by_layer
-#         label_source: 'llm_permutation' or 'xu'
-
-#     Returns:
-#         float confidence score (higher = more confident classification)
-#     """
-#     label = neuron_dict['label']
-#     if label_source in ('llm_permutation', 'llm_pmbt'):
-#         # 1 - p_value gives a 0→1 confidence where 1 is most significant
-#         return 1.0 - neuron_dict.get('p_value', 1.0)
-#     else:
-#         # xu labels store per-class probabilities pv/pt/pm/pu
-#         prob_map = {'visual': 'pv', 'text': 'pt',
-#                     'multimodal': 'pm', 'unknown': 'pu'}
-#         key = prob_map.get(label, 'pu')
-#         return neuron_dict.get(key, 0.0)
-
-
-# def get_ranked_neurons_by_type(raw_by_layer, label_source='llm_permutation'):
-#     """Rank all neurons of each type globally by confidence score.
-
-#     Returns:
-#         ranked: dict {label: list of (layer_idx, neuron_idx, score)}
-#             Sorted descending by confidence score.
-#     """
-#     ranked = {'visual': [], 'text': [], 'multimodal': [], 'unknown': []}
-#     for layer_idx, neuron_list in raw_by_layer.items():
-#         for ndata in neuron_list:
-#             label = ndata['label']
-#             if label not in ranked:
-#                 continue
-#             score = get_confidence_score(ndata, label_source)
-#             ranked[label].append((layer_idx, ndata['neuron_idx'], score))
-
-#     # Sort each type by confidence descending
-#     for label in ranked:
-#         ranked[label].sort(key=lambda x: x[2], reverse=True)
-
-#     return ranked
-
-
-# def extract_down_proj_norms(model, model_type, n_layers=32):
-#     """Extract the L2 norm of each column of the down_proj weight matrix.
-
-#     In the LLaMA FFN computation:
-#         gate = gate_proj(x)
-#         up   = up_proj(x)
-#         intermediate = silu(gate) * up          ← "neuron activations"
-#         output = down_proj(intermediate)         ← projects back to residual
-
-#     Each neuron j's actual contribution to the layer output is:
-#         contribution_j = activation_j * down_proj[:, j]
-
-#     The column norm ||down_proj[:, j]|| tells you how much the model
-#     amplifies neuron j's signal. A neuron with large activation but
-#     tiny down_proj column has low actual impact.
-
-#     Args:
-#         model: the LLaVA model
-#         model_type: 'hf' or 'liuhaotian'
-#         n_layers: number of LLM layers
-
-#     Returns:
-#         norms: dict {layer_idx: tensor of shape (n_neurons,)}
-#             L2 norm of each down_proj column per layer.
-#     """
-#     norms = {}
-#     for layer_idx in range(n_layers):
-#         if model_type == 'hf':
-#             layer = model.language_model.model.layers[layer_idx]
-#         else:
-#             layer = model.model.layers[layer_idx]
-
-#         # down_proj weight shape: (hidden_size, intermediate_size)
-#         # Column j = down_proj.weight[:, j] = the vector that neuron j
-#         # projects into the residual stream
-#         W_down = layer.mlp.down_proj.weight.detach().float()
-#         # L2 norm of each column (dim=0 gives norm over hidden_size)
-#         col_norms = W_down.norm(dim=0)  # shape: (intermediate_size,)
-#         norms[layer_idx] = col_norms.cpu()
-
-#     return norms
-
-
-# def compute_cett_rankings(model, model_type, tokenizer_or_processor,
-#                           image_processor, image_token_id,
-#                           img_dir, labels_by_layer, device,
-#                           n_images=30, n_layers=32, seed=42):
-#     """Compute total CETT per neuron and return rankings.
-
-#     CETT (Contribution to layer output) for neuron j:
-
-#         total_cett_j = mean_activation_j × ||down_proj[:, j]||
-
-#     mean_activation_j is averaged over all token positions and all
-#     reference images. ||down_proj[:, j]|| is the L2 norm of column j
-#     of the down_proj weight matrix — the model's architectural
-#     amplification factor for neuron j.
-
-#     This ranks neurons by their actual impact on the layer output.
-#     A neuron with high activation but tiny down_proj column has low
-#     CETT (fires hard but the model ignores it). A neuron with modest
-#     activation but large down_proj column has high CETT (the model
-#     amplifies its signal).
-
-#     All neuron types (visual, text, multimodal) are ranked by the
-#     same metric. The labels determine which group a neuron belongs
-#     to; the total CETT determines its rank within that group.
-#     Ablating higher-CETT neurons first causes more disruption to
-#     the layer output.
-
-#     Args:
-#         model, model_type, tokenizer_or_processor, image_processor,
-#             image_token_id: model components
-#         img_dir: path to COCO val images
-#         labels_by_layer: needed to know which neurons exist per layer
-#         device: torch device string
-#         n_images: reference images for CETT estimation
-#         n_layers: number of LLM layers
-#         seed: random seed
-
-#     Returns:
-#         cett_ranked: dict {label: [(layer_idx, neuron_idx, total_cett)]}
-#             Same format as get_ranked_neurons_by_type(), scored by
-#             total CETT. Sorted descending (highest contribution first).
-#         cett_scores: dict {layer_idx: np.array of shape (n_neurons,)}
-#             Total CETT per neuron per layer.
-#     """
-#     print('\n  Computing total CETT rankings ...')
-
-#     # ── Step 1: Extract down_proj column norms (from weights) ──
-#     print('    Extracting down_proj column norms ...')
-#     down_norms = extract_down_proj_norms(model, model_type, n_layers)
-
-#     # ── Step 2: Select reference images ──
-#     rng = np.random.RandomState(seed)
-#     img_files = sorted([f for f in os.listdir(img_dir)
-#                         if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
-#     if len(img_files) > n_images:
-#         img_files = rng.choice(img_files, size=n_images,
-#                                replace=False).tolist()
-
-#     # ── Step 3: Register hooks to accumulate mean activations ──
-#     act_sum = {}  # {layer: array (n_neurons,)} running sum of mean(act)
-#     hooks = []
-
-#     for layer_idx in sorted(labels_by_layer.keys()):
-#         n_neurons = len(labels_by_layer[layer_idx])
-#         act_sum[layer_idx] = np.zeros(n_neurons, dtype=np.float64)
-
-#         if model_type == 'hf':
-#             layer_mod = model.language_model.model.layers[layer_idx]
-#         else:
-#             layer_mod = model.model.layers[layer_idx]
-
-#         act_fn = layer_mod.mlp.act_fn
-
-#         # Only record from the first forward pass per image
-#         # (model.generate calls forward multiple times for each token)
-#         act_fn._cett_recorded = False
-
-#         def make_hook(lidx, act_fn_ref):
-#             def hook_fn(module, input, output):
-#                 if act_fn_ref._cett_recorded:
-#                     return
-#                 # output shape: (1, seq_len, n_neurons)
-#                 # Mean over all token positions → (n_neurons,)
-#                 acts = output[0].detach().float().cpu().numpy()
-#                 act_sum[lidx] += acts.mean(axis=0)
-#                 act_fn_ref._cett_recorded = True
-#             return hook_fn
-
-#         h = act_fn.register_forward_hook(make_hook(layer_idx, act_fn))
-#         hooks.append(h)
-
-#     # ── Step 4: Run forward passes ──
-#     n_processed = 0
-#     print(f'    Running {len(img_files)} forward passes ...')
-
-#     for img_file in tqdm(img_files, desc='CETT'):
-#         img_path = os.path.join(img_dir, img_file)
-#         try:
-#             img = Image.open(img_path).convert('RGB')
-#         except Exception:
-#             continue
-
-#         # Reset recording flags
-#         for layer_idx in labels_by_layer:
-#             if model_type == 'hf':
-#                 act_fn = model.language_model.model.layers[layer_idx].mlp.act_fn
-#             else:
-#                 act_fn = model.model.layers[layer_idx].mlp.act_fn
-#             act_fn._cett_recorded = False
-
-#         # Prepare inputs and run forward pass
-#         with torch.no_grad():
-#             if model_type == 'hf':
-#                 prompt = "USER: <image>\nDescribe this image.\nASSISTANT:"
-#                 inputs = tokenizer_or_processor(
-#                     images=img, text=prompt, return_tensors='pt').to(device)
-#                 model.generate(**inputs, max_new_tokens=1, do_sample=False)
-#             else:
-#                 from llava.conversation import conv_templates
-#                 from llava.constants import IMAGE_TOKEN_INDEX
-#                 from llava.mm_utils import tokenizer_image_token
-
-#                 conv = conv_templates["v1"].copy()
-#                 conv.append_message(conv.roles[0],
-#                                     "<image>\nDescribe this image.")
-#                 conv.append_message(conv.roles[1], None)
-#                 prompt = conv.get_prompt()
-
-#                 input_ids = tokenizer_image_token(
-#                     prompt, tokenizer_or_processor, IMAGE_TOKEN_INDEX,
-#                     return_tensors='pt'
-#                 ).unsqueeze(0).to(device)
-
-#                 image_tensor = image_processor.preprocess(
-#                     img, return_tensors='pt'
-#                 )['pixel_values'].half().to(device)
-
-#                 model.generate(input_ids, images=image_tensor,
-#                                max_new_tokens=1, do_sample=False)
-
-#         n_processed += 1
-
-#     # ── Step 5: Remove hooks and clean up ──
-#     for h in hooks:
-#         h.remove()
-#     for layer_idx in labels_by_layer:
-#         if model_type == 'hf':
-#             act_fn = model.language_model.model.layers[layer_idx].mlp.act_fn
-#         else:
-#             act_fn = model.model.layers[layer_idx].mlp.act_fn
-#         if hasattr(act_fn, '_cett_recorded'):
-#             delattr(act_fn, '_cett_recorded')
-
-#     # ── Step 6: Compute total CETT per neuron ──
-#     cett_scores = {}
-
-#     for layer_idx in sorted(labels_by_layer.keys()):
-#         dn = down_norms[layer_idx].numpy()
-#         n_neurons = len(labels_by_layer[layer_idx])
-#         dn = dn[:n_neurons]
-
-#         # Total CETT = mean_activation × ||down_proj column||
-#         mean_act = act_sum[layer_idx] / max(n_processed, 1)
-#         cett_scores[layer_idx] = mean_act * dn
-
-#     # ── Step 7: Build rankings (same metric for all groups) ──
-#     cett_ranked = {'visual': [], 'text': [], 'multimodal': [], 'unknown': []}
-
-#     for layer_idx, labels in labels_by_layer.items():
-#         scores = cett_scores.get(layer_idx)
-#         if scores is None:
-#             continue
-#         for nidx, label in enumerate(labels):
-#             if label not in cett_ranked:
-#                 continue
-#             cett_ranked[label].append(
-#                 (layer_idx, nidx, float(scores[nidx])))
-
-#     # Sort each type by total CETT descending
-#     for label in cett_ranked:
-#         cett_ranked[label].sort(key=lambda x: x[2], reverse=True)
-
-#     # Print summary
-#     print(f'    Processed {n_processed} images')
-#     for label in ['visual', 'text', 'multimodal']:
-#         ranking = cett_ranked[label]
-#         if ranking:
-#             top = ranking[0]
-#             print(f'    {label:12s} CETT top: layer={top[0]} '
-#                   f'neuron={top[1]} score={top[2]:.6f}  '
-#                   f'({len(ranking)} neurons)')
-
-#     return cett_ranked, cett_scores
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 2 — Model loading (reuses patterns from classification)
-# # ═══════════════════════════════════════════════════════════════════
-
-# def load_model_original(model_path, device):
-#     """Load the original LLaVA model via the LLaVA repo."""
-#     from llava.model.builder import load_pretrained_model
-#     from llava.mm_utils import get_model_name_from_path
-#     from llava.constants import IMAGE_TOKEN_INDEX
-
-#     model_name = get_model_name_from_path(model_path)
-#     tokenizer, model, image_processor, context_len = load_pretrained_model(
-#         model_path, None, model_name, device_map=device,
-#         torch_dtype=torch.float16
-#     )
-#     model.eval()
-#     return model, tokenizer, image_processor, IMAGE_TOKEN_INDEX
-
-
-# def load_model_hf(hf_id, device):
-#     """Load the HuggingFace LLaVA model."""
-#     from transformers import AutoProcessor, LlavaForConditionalGeneration
-
-#     processor = AutoProcessor.from_pretrained(hf_id)
-#     model = LlavaForConditionalGeneration.from_pretrained(
-#         hf_id, torch_dtype=torch.float16, low_cpu_mem_usage=True
-#     ).to(device).eval()
-#     image_token_id = model.config.image_token_index
-#     return model, processor, None, image_token_id
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 3 — Ablation hooks
-# # ═══════════════════════════════════════════════════════════════════
-
-# def make_ablation_hooks(model, model_type, ablate_indices, n_layers=32,
-#                         method='zero', neuron_stats=None, seed=42):
-#     """Register forward hooks that ablate specified neurons at act_fn output.
-
-#     Args:
-#         model: the LLaVA model
-#         model_type: 'hf' or 'liuhaotian'
-#         ablate_indices: dict {layer_idx: list of neuron indices to ablate}
-#         n_layers: total number of layers
-#         method: ablation strategy —
-#             'zero'       — set activations to 0 (default, most disruptive)
-#             'mean'       — replace with per-neuron mean from reference data
-#             'noise'      — replace with N(mean, std) random noise
-#             'clamp_high' — clamp to 95th-percentile value
-#             'clamp_low'  — clamp to 5th-percentile value
-#         neuron_stats: dict {layer_idx: {neuron_idx: {'mean': float,
-#             'std': float, 'p5': float, 'p95': float}}}
-#             Required for mean/noise/clamp methods. Obtained from
-#             collect_neuron_stats().
-#         seed: random seed for noise method
-
-#     Returns:
-#         list of hook handles (call .remove() to deregister)
-#     """
-#     handles = []
-#     rng = torch.Generator()
-#     rng.manual_seed(seed)
-
-#     for layer_idx, neuron_indices in ablate_indices.items():
-#         if not neuron_indices:
-#             continue
-
-#         indices_tensor = torch.tensor(neuron_indices, dtype=torch.long)
-
-#         # Pre-compute replacement values per neuron for this layer
-#         replacement_vals = None
-#         if method in ('mean', 'noise', 'clamp_high', 'clamp_low') and neuron_stats:
-#             layer_stats = neuron_stats.get(layer_idx, {})
-#             vals = []
-#             for nidx in neuron_indices:
-#                 ns = layer_stats.get(nidx, {'mean': 0.0, 'std': 1.0,
-#                                              'p5': 0.0, 'p95': 0.0})
-#                 if method == 'mean':
-#                     vals.append(ns['mean'])
-#                 elif method == 'clamp_high':
-#                     vals.append(ns['p95'])
-#                 elif method == 'clamp_low':
-#                     vals.append(ns['p5'])
-#                 else:  # noise — store mean and std for runtime sampling
-#                     vals.append((ns['mean'], ns['std']))
-#             if method != 'noise':
-#                 replacement_vals = torch.tensor(vals, dtype=torch.float16)
-
-#         # Get the act_fn module
-#         if model_type == 'hf':
-#             layer = model.language_model.model.layers[layer_idx]
-#         else:
-#             layer = model.model.layers[layer_idx]
-
-#         act_fn = layer.mlp.act_fn
-
-#         def hook_fn(module, input, output, _indices=indices_tensor,
-#                     _method=method, _repl=replacement_vals,
-#                     _noise_params=vals if method == 'noise' else None):
-#             device = output.device
-#             idx = _indices.to(device)
-
-#             if _method == 'zero':
-#                 # Set activations to exactly 0
-#                 output[:, :, idx] = 0.0
-
-#             elif _method in ('mean', 'clamp_high', 'clamp_low'):
-#                 # Replace with pre-computed constant per neuron
-#                 # _repl shape: (n_neurons,) → broadcast over (batch, seq)
-#                 output[:, :, idx] = _repl.to(device)
-
-#             elif _method == 'noise':
-#                 # Replace with Gaussian noise ~ N(mean, std) per neuron
-#                 for i, nidx in enumerate(idx):
-#                     mu, sigma = _noise_params[i]
-#                     noise = torch.randn(
-#                         output[:, :, nidx].shape,
-#                         device=device, dtype=output.dtype
-#                     ) * sigma + mu
-#                     output[:, :, nidx] = noise
-
-#             return output
-
-#         h = act_fn.register_forward_hook(hook_fn)
-#         handles.append(h)
-
-#     return handles
-
-
-# def build_ablation_indices(condition, neuron_indices_by_type, labels_by_layer,
-#                            seed=42, top_n=None, layer_range=None,
-#                            ranked_neurons=None):
-#     """Build the dict of {layer_idx: [neuron_indices]} for a given condition.
-
-#     Args:
-#         condition: one of 'baseline', 'ablate_text', 'ablate_vis',
-#                    'ablate_multi', 'random'
-#         neuron_indices_by_type: output of get_neuron_indices_by_type()
-#         labels_by_layer: output of load_neuron_labels()
-#         seed: random seed for 'random' condition
-#         top_n: if set, only ablate the top N most confident neurons
-#             of the target type (ranked by classification confidence).
-#             Requires ranked_neurons to be provided.
-#         layer_range: tuple (start, end) — only ablate neurons in
-#             layers[start:end+1]. None means all layers.
-#         ranked_neurons: output of get_ranked_neurons_by_type() —
-#             needed when top_n is set.
-
-#     Returns:
-#         dict {layer_idx: list of neuron indices to ablate}
-#     """
-#     if condition == 'baseline':
-#         return {}
-
-#     type_map = {
-#         'ablate_text': 'text',
-#         'ablate_vis': 'visual',
-#         'ablate_multi': 'multimodal',
-#     }
-
-#     if condition in type_map:
-#         target_type = type_map[condition]
-
-#         # ── Top-N mode: pick N most confident neurons globally ──
-#         if top_n is not None and ranked_neurons is not None:
-#             ranking = ranked_neurons.get(target_type, [])
-#             selected = ranking[:top_n]  # already sorted by confidence desc
-#             ablate = {}
-#             for lay, nidx, score in selected:
-#                 # Apply layer range filter
-#                 if layer_range and not (layer_range[0] <= lay <= layer_range[1]):
-#                     continue
-#                 ablate.setdefault(lay, []).append(nidx)
-#             return ablate
-
-#         # ── Full ablation (all neurons of this type) ──
-#         full = dict(neuron_indices_by_type.get(target_type, {}))
-#         if layer_range:
-#             return {l: v for l, v in full.items()
-#                     if layer_range[0] <= l <= layer_range[1]}
-#         return full
-
-#     if condition == 'random':
-#         # Match the size of the LARGEST targeted ablation in this run
-#         # (or text neurons if nothing else specified)
-#         rng = np.random.RandomState(seed)
-#         ablate = {}
-#         text_indices = neuron_indices_by_type.get('text', {})
-#         for layer_idx, labels in labels_by_layer.items():
-#             if layer_range and not (layer_range[0] <= layer_idx <= layer_range[1]):
-#                 continue
-#             n_to_ablate = len(text_indices.get(layer_idx, []))
-#             if top_n is not None:
-#                 # For top_n mode, match the total count across all layers
-#                 # We'll compute this below after the loop
-#                 pass
-#             if n_to_ablate > 0:
-#                 all_indices = list(range(len(labels)))
-#                 chosen = rng.choice(all_indices, size=min(n_to_ablate, len(all_indices)),
-#                                     replace=False).tolist()
-#                 ablate[layer_idx] = chosen
-
-#         # If top_n is set, adjust random count to match the targeted total
-#         if top_n is not None and ranked_neurons is not None:
-#             # Find how many neurons are actually ablated in the corresponding
-#             # targeted condition (use 'visual' as reference)
-#             ref_type = 'visual'
-#             ref_ranking = ranked_neurons.get(ref_type, [])
-#             ref_selected = ref_ranking[:top_n]
-#             if layer_range:
-#                 ref_selected = [(l, n, s) for l, n, s in ref_selected
-#                                 if layer_range[0] <= l <= layer_range[1]]
-#             target_total = len(ref_selected)
-
-#             # Redistribute randomly across layers
-#             rng2 = np.random.RandomState(seed)
-#             ablate = {}
-#             valid_layers = [l for l in labels_by_layer
-#                             if not layer_range or
-#                             (layer_range[0] <= l <= layer_range[1])]
-#             if valid_layers and target_total > 0:
-#                 n_per_layer = len(next(iter(labels_by_layer.values())))
-#                 total_pool = len(valid_layers) * n_per_layer
-#                 remaining = min(target_total, total_pool)
-#                 # Spread evenly then sample
-#                 per_layer = remaining // len(valid_layers)
-#                 extra = remaining % len(valid_layers)
-#                 for i, lay in enumerate(sorted(valid_layers)):
-#                     n_this = per_layer + (1 if i < extra else 0)
-#                     if n_this > 0:
-#                         all_idx = list(range(len(labels_by_layer[lay])))
-#                         chosen = rng2.choice(all_idx,
-#                                              size=min(n_this, len(all_idx)),
-#                                              replace=False).tolist()
-#                         ablate[lay] = chosen
-
-#         return ablate
-
-#     raise ValueError(f'Unknown condition: {condition}')
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 3b — Neuron statistics collection (for mean/noise/clamp)
-# # ═══════════════════════════════════════════════════════════════════
-
-# def collect_neuron_stats(model, model_type, tokenizer_or_processor,
-#                          image_processor, image_token_id,
-#                          img_dir, device, n_images=50, n_layers=32,
-#                          seed=42):
-#     """Run reference images through the model and collect activation stats.
-
-#     Records mean, std, 5th/95th percentile of each neuron's post-act_fn
-#     activation across all positions and images. These stats are used by
-#     mean/noise/clamp ablation methods.
-
-#     Args:
-#         model, model_type, tokenizer_or_processor, image_processor,
-#             image_token_id: model components (same as evaluation)
-#         img_dir: path to directory of reference images (COCO val)
-#         device: torch device string
-#         n_images: how many reference images to use (50 is sufficient)
-#         n_layers: number of LLM layers
-#         seed: for reproducible image sampling
-
-#     Returns:
-#         neuron_stats: dict {layer_idx: {neuron_idx: {
-#             'mean': float, 'std': float, 'p5': float, 'p95': float}}}
-#     """
-#     print(f'  Collecting neuron activation stats from {n_images} images ...')
-
-#     # Find reference images
-#     rng = np.random.RandomState(seed)
-#     img_files = sorted([f for f in os.listdir(img_dir)
-#                         if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
-#     if len(img_files) > n_images:
-#         img_files = rng.choice(img_files, size=n_images,
-#                                replace=False).tolist()
-
-#     # Register recording hooks on every layer's act_fn
-#     # Collect per-layer running statistics using Welford's algorithm
-#     # to avoid storing all activations in memory
-#     layer_accumulators = {}
-#     hooks = []
-
-#     for layer_idx in range(n_layers):
-#         if model_type == 'hf':
-#             layer = model.language_model.model.layers[layer_idx]
-#         else:
-#             layer = model.model.layers[layer_idx]
-
-#         act_fn = layer.mlp.act_fn
-
-#         # Each accumulator tracks: count, mean, M2, min-heap, max-heap
-#         acc = {
-#             'count': 0,
-#             'mean': None,
-#             'M2': None,
-#             'all_vals': [],  # store a subsample for percentiles
-#         }
-#         layer_accumulators[layer_idx] = acc
-
-#         def make_hook(acc_ref, lidx):
-#             def hook_fn(module, input, output):
-#                 # output: (batch, seq_len, n_neurons)
-#                 # Average over batch and seq dimensions
-#                 vals = output.detach().float()
-#                 # Mean over batch and sequence → (n_neurons,)
-#                 batch_mean = vals.mean(dim=(0, 1)).cpu().numpy()
-
-#                 if acc_ref['mean'] is None:
-#                     acc_ref['mean'] = np.zeros_like(batch_mean)
-#                     acc_ref['M2'] = np.zeros_like(batch_mean)
-
-#                 acc_ref['count'] += 1
-#                 delta = batch_mean - acc_ref['mean']
-#                 acc_ref['mean'] += delta / acc_ref['count']
-#                 delta2 = batch_mean - acc_ref['mean']
-#                 acc_ref['M2'] += delta * delta2
-
-#                 # Store subsample for percentile estimation (first 20 images)
-#                 if acc_ref['count'] <= 20:
-#                     acc_ref['all_vals'].append(batch_mean.copy())
-
-#             return hook_fn
-
-#         h = act_fn.register_forward_hook(make_hook(acc, layer_idx))
-#         hooks.append(h)
-
-#     # Run forward passes
-#     prompt = "Describe this image briefly."
-#     for img_file in tqdm(img_files, desc='Stats collection'):
-#         img_path = os.path.join(img_dir, img_file)
-#         try:
-#             img = Image.open(img_path).convert('RGB')
-#         except Exception:
-#             continue
-
-#         # Simple forward pass (just generation of a few tokens)
-#         generate_answer(model, model_type, tokenizer_or_processor,
-#                         image_processor, image_token_id,
-#                         img, prompt, device, max_new_tokens=5)
-
-#     # Remove recording hooks
-#     for h in hooks:
-#         h.remove()
-
-#     # Build stats dict
-#     neuron_stats = {}
-#     for layer_idx, acc in layer_accumulators.items():
-#         if acc['mean'] is None or acc['count'] < 2:
-#             continue
-
-#         variance = acc['M2'] / max(acc['count'] - 1, 1)
-#         std = np.sqrt(np.maximum(variance, 0.0))
-
-#         # Compute percentiles from subsample
-#         if acc['all_vals']:
-#             stacked = np.stack(acc['all_vals'])  # (n_samples, n_neurons)
-#             p5 = np.percentile(stacked, 5, axis=0)
-#             p95 = np.percentile(stacked, 95, axis=0)
-#         else:
-#             p5 = acc['mean'] - 1.645 * std
-#             p95 = acc['mean'] + 1.645 * std
-
-#         layer_stats = {}
-#         n_neurons = len(acc['mean'])
-#         for nidx in range(n_neurons):
-#             layer_stats[nidx] = {
-#                 'mean': float(acc['mean'][nidx]),
-#                 'std': float(std[nidx]),
-#                 'p5': float(p5[nidx]),
-#                 'p95': float(p95[nidx]),
-#             }
-#         neuron_stats[layer_idx] = layer_stats
-
-#     print(f'  Collected stats for {len(neuron_stats)} layers '
-#           f'({acc["count"]} images processed)')
-#     return neuron_stats
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 4 — POPE evaluation
-# # ═══════════════════════════════════════════════════════════════════
-
-# def load_pope_questions(pope_path, num_questions=None):
-#     """Load POPE questions from JSONL file.
-
-#     Returns list of dicts with keys: question_id, image, text, label
-#     """
-#     questions = []
-#     with open(pope_path) as f:
-#         for line in f:
-#             line = line.strip()
-#             if not line:
-#                 continue
-#             q = json.loads(line)
-#             questions.append(q)
-#     if num_questions is not None and num_questions < len(questions):
-#         questions = questions[:num_questions]
-#     return questions
-
-
-# def evaluate_pope(model, model_type, tokenizer_or_processor, image_processor,
-#                   image_token_id, questions, img_dir, device):
-#     """Run POPE evaluation: ask yes/no questions, measure accuracy + F1.
-
-#     Returns dict with accuracy, precision, recall, f1, yes_ratio, n_questions.
-#     """
-#     correct = 0
-#     tp = fp = fn = tn = 0
-#     total = 0
-#     n_yes_pred = 0
-
-#     for q in tqdm(questions, desc='POPE eval'):
-#         img_path = os.path.join(img_dir, q['image'])
-#         if not os.path.isfile(img_path):
-#             continue
-
-#         try:
-#             img = Image.open(img_path).convert('RGB')
-#         except Exception:
-#             continue
-
-#         question_text = q['text']
-#         gt_label = q['label'].strip().lower()
-
-#         # Generate answer (POPE is yes/no, so 10 tokens is plenty)
-#         answer = generate_answer(model, model_type, tokenizer_or_processor,
-#                                  image_processor, image_token_id,
-#                                  img, question_text, device,
-#                                  max_new_tokens=10)
-#         answer_lower = answer.strip().lower()
-
-#         # Parse yes/no
-#         pred_yes = answer_lower.startswith('yes')
-#         gt_yes = gt_label == 'yes'
-
-#         if pred_yes == gt_yes:
-#             correct += 1
-#         if pred_yes and gt_yes:
-#             tp += 1
-#         elif pred_yes and not gt_yes:
-#             fp += 1
-#         elif not pred_yes and gt_yes:
-#             fn += 1
-#         else:
-#             tn += 1
-
-#         if pred_yes:
-#             n_yes_pred += 1
-#         total += 1
-
-#     accuracy = correct / max(total, 1)
-#     precision = tp / max(tp + fp, 1)
-#     recall = tp / max(tp + fn, 1)
-#     f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-#     yes_ratio = n_yes_pred / max(total, 1)
-
-#     return {
-#         'accuracy': round(accuracy, 4),
-#         'precision': round(precision, 4),
-#         'recall': round(recall, 4),
-#         'f1': round(f1, 4),
-#         'yes_ratio': round(yes_ratio, 4),
-#         'n_questions': total,
-#         'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
-#     }
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 5 — CHAIR evaluation
-# # ═══════════════════════════════════════════════════════════════════
-
-# def load_coco_objects(ann_path):
-#     """Load COCO instance annotations → {image_id: set of category names}."""
-#     with open(ann_path) as f:
-#         data = json.load(f)
-#     cat_id_to_name = {c['id']: c['name'] for c in data['categories']}
-#     image_objects = {}
-#     for ann in data['annotations']:
-#         img_id = ann['image_id']
-#         cat_name = cat_id_to_name[ann['category_id']]
-#         image_objects.setdefault(img_id, set()).add(cat_name.lower())
-#     return image_objects, cat_id_to_name
-
-
-# def evaluate_chair(model, model_type, tokenizer_or_processor, image_processor,
-#                    image_token_id, ann_path, img_dir, device,
-#                    num_images=500, seed=42):
-#     """Run CHAIR evaluation: generate captions, measure object hallucination.
-
-#     CHAIR_i = hallucinated objects / total mentioned objects
-#     CHAIR_s = sentences with hallucination / total sentences
-
-#     Returns dict with chair_i, chair_s, n_images, avg_caption_len.
-#     """
-#     image_objects, cat_id_to_name = load_coco_objects(ann_path)
-#     all_cat_names = set(n.lower() for n in cat_id_to_name.values())
-
-#     # Get image filenames
-#     with open(ann_path) as f:
-#         data = json.load(f)
-#     id_to_filename = {img['id']: img['file_name'] for img in data['images']}
-
-#     # Sample images that have annotations
-#     rng = np.random.RandomState(seed)
-#     valid_ids = [iid for iid in image_objects if iid in id_to_filename]
-#     if num_images < len(valid_ids):
-#         chosen_ids = rng.choice(valid_ids, size=num_images, replace=False).tolist()
-#     else:
-#         chosen_ids = valid_ids
-
-#     total_objects_mentioned = 0
-#     total_hallucinated = 0
-#     total_sentences = 0
-#     sentences_with_hallucination = 0
-#     total_caption_len = 0
-
-#     for img_id in tqdm(chosen_ids, desc='CHAIR eval'):
-#         filename = id_to_filename[img_id]
-#         img_path = os.path.join(img_dir, filename)
-#         if not os.path.isfile(img_path):
-#             continue
-
-#         try:
-#             img = Image.open(img_path).convert('RGB')
-#         except Exception:
-#             continue
-
-#         # Generate caption (100 tokens is plenty for a description)
-#         caption = generate_answer(model, model_type, tokenizer_or_processor,
-#                                   image_processor, image_token_id,
-#                                   img, "Could you describe the image?", device,
-#                                   max_new_tokens=100)
-
-#         gt_objects = image_objects.get(img_id, set())
-#         total_caption_len += len(caption.split())
-
-#         # Check each sentence for hallucinated objects
-#         sentences = [s.strip() for s in caption.replace('\n', '.').split('.')
-#                      if s.strip()]
-#         for sentence in sentences:
-#             sentence_lower = sentence.lower()
-#             total_sentences += 1
-#             sentence_has_hallucination = False
-
-#             for cat_name in all_cat_names:
-#                 if cat_name in sentence_lower:
-#                     total_objects_mentioned += 1
-#                     if cat_name not in gt_objects:
-#                         total_hallucinated += 1
-#                         sentence_has_hallucination = True
-
-#             if sentence_has_hallucination:
-#                 sentences_with_hallucination += 1
-
-#     chair_i = total_hallucinated / max(total_objects_mentioned, 1)
-#     chair_s = sentences_with_hallucination / max(total_sentences, 1)
-#     avg_len = total_caption_len / max(len(chosen_ids), 1)
-
-#     return {
-#         'chair_i': round(chair_i, 4),
-#         'chair_s': round(chair_s, 4),
-#         'n_images': len(chosen_ids),
-#         'total_objects_mentioned': total_objects_mentioned,
-#         'total_hallucinated': total_hallucinated,
-#         'total_sentences': total_sentences,
-#         'sentences_with_hallucination': sentences_with_hallucination,
-#         'avg_caption_len': round(avg_len, 1),
-#     }
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 6 — Generation helper
-# # ═══════════════════════════════════════════════════════════════════
-
-# def generate_answer(model, model_type, tokenizer_or_processor, image_processor,
-#                     image_token_id, img, question, device, max_new_tokens=512):
-#     """Generate a text answer for an image + question.
-
-#     Handles both HF and original LLaVA backends.
-#     """
-#     with torch.no_grad():
-#         if model_type == 'hf':
-#             prompt = f"USER: <image>\n{question}\nASSISTANT:"
-#             inputs = tokenizer_or_processor(
-#                 images=img, text=prompt, return_tensors='pt'
-#             ).to(device)
-#             output_ids = model.generate(
-#                 **inputs,
-#                 max_new_tokens=max_new_tokens,
-#                 do_sample=False,
-#             )
-#             # Decode only the generated tokens (skip the prompt)
-#             prompt_len = inputs['input_ids'].shape[1]
-#             answer = tokenizer_or_processor.decode(
-#                 output_ids[0][prompt_len:], skip_special_tokens=True)
-#         else:
-#             from llava.conversation import conv_templates
-#             from llava.constants import IMAGE_TOKEN_INDEX
-#             from llava.mm_utils import tokenizer_image_token
-
-#             conv = conv_templates["v1"].copy()
-#             conv.append_message(conv.roles[0], f"<image>\n{question}")
-#             conv.append_message(conv.roles[1], None)
-#             prompt = conv.get_prompt()
-
-#             input_ids = tokenizer_image_token(
-#                 prompt, tokenizer_or_processor, IMAGE_TOKEN_INDEX,
-#                 return_tensors='pt'
-#             ).unsqueeze(0).to(device)
-
-#             image_tensor = image_processor.preprocess(
-#                 img, return_tensors='pt'
-#             )['pixel_values'].half().to(device)
-
-#             output_ids = model.generate(
-#                 input_ids,
-#                 images=image_tensor,
-#                 max_new_tokens=max_new_tokens,
-#                 do_sample=False,
-#             )
-#             answer = tokenizer_or_processor.decode(
-#                 output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
-
-#     return answer.strip()
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 6b — VQAv2 evaluation (+ perception/knowledge split)
-# # ═══════════════════════════════════════════════════════════════════
-
-# def load_vqav2(questions_path, annotations_path, num_questions=None, seed=42):
-#     """Load VQAv2 questions and annotations.
-
-#     Line 1: VQAv2 has separate files for questions and annotations.
-#     Line 2: We match them by question_id.
-
-#     Args:
-#         questions_path: path to questions JSON (standard or split format)
-#         annotations_path: path to annotations JSON
-#         num_questions: if set, sample this many questions
-#         seed: random seed for sampling
-
-#     Returns:
-#         list of dicts with keys: question_id, image_id, question,
-#             answers (list of str), image_file
-#     """
-#     with open(questions_path) as f:                                            # Line 3: load questions
-#         q_data = json.load(f)
-#     with open(annotations_path) as f:                                          # Line 4: load annotations
-#         a_data = json.load(f)
-
-#     # Line 5: Build annotation lookup {question_id: list of answer strings}
-#     ann_lookup = {}
-#     for ann in a_data['annotations']:
-#         answers = [a['answer'] for a in ann['answers']]                        # Line 6: 10 human answers
-#         ann_lookup[ann['question_id']] = answers
-
-#     items = []
-#     for q in q_data['questions']:                                              # Line 7: pair questions with answers
-#         qid = q['question_id']
-#         if qid not in ann_lookup:
-#             continue
-#         img_id = q['image_id']
-#         # Line 8: COCO val2014 filename format
-#         image_file = f'COCO_val2014_{img_id:012d}.jpg'
-#         items.append({
-#             'question_id': qid,
-#             'image_id': img_id,
-#             'question': q['question'],
-#             'answers': ann_lookup[qid],
-#             'image_file': image_file,
-#         })
-
-#     if num_questions is not None and num_questions < len(items):                # Line 9: subsample
-#         rng = np.random.RandomState(seed)
-#         indices = rng.choice(len(items), size=num_questions, replace=False)
-#         items = [items[i] for i in indices]
-
-#     return items
-
-
-# def vqav2_accuracy(pred, gt_answers):
-#     """Compute VQAv2 soft accuracy for a single prediction.
-
-#     Line 1: Standard VQAv2 metric — min(#humans who gave this answer / 3, 1).
-#     Line 2: If 3+ out of 10 annotators agree with the prediction, score = 1.0.
-#     """
-#     pred_clean = pred.strip().lower().rstrip('.')                              # Line 3: normalize prediction
-#     count = sum(1 for a in gt_answers if a.strip().lower() == pred_clean)      # Line 4: count matches
-#     return min(count / 3.0, 1.0)                                              # Line 5: VQAv2 formula
-
-
-# def evaluate_vqav2(model, model_type, tokenizer_or_processor, image_processor,
-#                    image_token_id, vqa_items, img_dir, device):
-#     """Run VQAv2 evaluation: ask visual questions, measure accuracy.
-
-#     Line 1: Each VQAv2 question is about an image. We pass the image and
-#     question to the model, then compare the free-form answer against
-#     10 human-annotated ground truth answers using soft accuracy.
-#     """
-#     scores = []                                                                # Line 2: accumulate per-question scores
-#     for item in tqdm(vqa_items, desc='VQAv2 eval'):
-#         img_path = os.path.join(img_dir, item['image_file'])                   # Line 3: build image path
-#         if not os.path.isfile(img_path):
-#             continue
-
-#         prompt = f"Answer the question briefly.\nQuestion: {item['question']}\nAnswer:"  # Line 4: prompt template
-
-#         answer = generate_with_image(                                          # Line 5: generate answer
-#             model, model_type, tokenizer_or_processor,
-#             image_processor, image_token_id,
-#             device, img_path, prompt, max_new_tokens=20)
-
-#         score = vqav2_accuracy(answer, item['answers'])                        # Line 6: soft accuracy
-#         scores.append(score)
-
-#     accuracy = sum(scores) / len(scores) if scores else 0.0                    # Line 7: mean accuracy
-#     return {
-#         'accuracy': round(accuracy, 4),
-#         'n_questions': len(scores),
-#     }
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 7 — Argument parsing
-# # ═══════════════════════════════════════════════════════════════════
-
-# def parse_args():
-#     p = argparse.ArgumentParser(
-#         description='Ablation validation of neuron taxonomy')
-
-#     # Model
-#     p.add_argument('--model_type', default='liuhaotian',
-#                    choices=['hf', 'liuhaotian'])
-#     p.add_argument('--original_model_path', default='liuhaotian/llava-v1.5-7b')
-#     p.add_argument('--hf_id', default='llava-hf/llava-1.5-7b-hf')
-
-#     # Labels
-#     p.add_argument('--labels_dir', required=False,
-#                    help='Directory with permutation-test neuron labels')
-
-#     # Output
-#     p.add_argument('--output_dir', default='results/ablation')
-
-#     # Ablation conditions
-#     p.add_argument('--conditions', nargs='+',
-#                    default=['baseline', 'ablate_text', 'ablate_vis',
-#                             'ablate_multi', 'random'],
-#                    help='Ablation conditions to run')
-#     p.add_argument('--num_images', type=int, default=100,
-#                    help='Number of images for evaluation')
-
-#     # POPE
-#     p.add_argument('--pope_path', default=None,
-#                    help='Path to POPE JSONL file')
-#     p.add_argument('--pope_img_dir', default=None,
-#                    help='Path to COCO val images for POPE')
-#     p.add_argument('--pope_num_questions', type=int, default=None,
-#                    help='Limit number of POPE questions (for testing)')
-
-#     # CHAIR
-#     p.add_argument('--chair_ann_path', default=None,
-#                    help='Path to instances_val2014.json for CHAIR')
-#     p.add_argument('--chair_img_dir', default=None,
-#                    help='Path to COCO val images for CHAIR')
-#     p.add_argument('--chair_num_images', type=int, default=500)
-
-#     # VQAv2 (overall)
-#     p.add_argument('--vqav2_questions', default=None,
-#                    help='Path to v2_OpenEnded_mscoco_val2014_questions.json')
-#     p.add_argument('--vqav2_annotations', default=None,
-#                    help='Path to v2_mscoco_val2014_annotations.json')
-#     p.add_argument('--vqav2_img_dir', default=None,
-#                    help='Path to COCO val images for VQAv2 (same as POPE)')
-#     p.add_argument('--vqav2_num_questions', type=int, default=1000,
-#                    help='Number of VQAv2 questions to evaluate')
-
-#     # VQA split: perception vs knowledge
-#     p.add_argument('--vqa_perception_questions', default=None,
-#                    help='Path to vqav2_perception_questions.json')
-#     p.add_argument('--vqa_perception_annotations', default=None,
-#                    help='Path to vqav2_perception_annotations.json')
-#     p.add_argument('--vqa_knowledge_questions', default=None,
-#                    help='Path to vqav2_knowledge_questions.json')
-#     p.add_argument('--vqa_knowledge_annotations', default=None,
-#                    help='Path to vqav2_knowledge_annotations.json')
-#     # Device
-#     p.add_argument('--device', default='0')
-#     p.add_argument('--seed', type=int, default=42)
-#     p.add_argument('--label_source', default='llm_permutation',
-#                    choices=['llm_permutation', 'xu', 'llm_pmbt'],
-#                    help='Which labels to use: permutation, xu (fixed-threshold), '
-#                         'or pmbt (Population-Median Binomial Test)')
-
-#     # ── Advanced ablation options (8 approaches) ──
-#     p.add_argument('--ablation_method', default='zero',
-#                    choices=['zero', 'mean', 'noise', 'clamp_high', 'clamp_low'],
-#                    help='How to ablate neurons: zero (set to 0), mean (replace '
-#                         'with dataset mean), noise (Gaussian noise matching '
-#                         'neuron stats), clamp_high (set to 95th percentile), '
-#                         'clamp_low (set to 5th percentile)')
-#     p.add_argument('--top_n', type=int, default=None,
-#                    help='Ablate only the top N most confident neurons per type '
-#                         '(for start-small-scale-up / ablation curve)')
-#     p.add_argument('--layer_range', default=None,
-#                    help='Only ablate neurons in this layer range, e.g. "0-10" '
-#                         'or "22-31" (for layer-specific ablation)')
-#     p.add_argument('--curve', action='store_true',
-#                    help='Run full ablation curve: sweep top_n over multiple '
-#                         'values (100,500,1000,5000,all) for each condition')
-#     p.add_argument('--curve_steps', default='100,500,1000,5000',
-#                    help='Comma-separated top_n values for --curve sweep '
-#                         '(default: 100,500,1000,5000)')
-#     p.add_argument('--n_stats_images', type=int, default=50,
-#                    help='Number of reference images for computing neuron '
-#                         'activation stats (mean/noise/clamp methods)')
-#     p.add_argument('--ranking_method', default='label',
-#                    choices=['label', 'cett'],
-#                    help='How to rank neurons for top_n / curve selection: '
-#                         '"label" uses classification confidence (1-p_value or '
-#                         'class probability), "cett" uses total CETT = '
-#                         'mean_activation × ||down_proj column||, ranking by '
-#                         'actual impact on layer output')
-#     p.add_argument('--n_cett_images', type=int, default=30,
-#                    help='Number of reference images for CETT computation')
-
-#     # Merge mode
-#     p.add_argument('--merge', action='store_true',
-#                    help='Merge per-condition results into summary, then exit')
-
-#     return p.parse_args()
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 8 — Merge
-# # ═══════════════════════════════════════════════════════════════════
-
-# def merge_results(args):
-#     """Merge per-condition ablation results into a single summary."""
-#     output_dir = args.output_dir
-#     condition_files = sorted(glob.glob(
-#         os.path.join(output_dir, 'ablation_condition_*.json')))
-
-#     if not condition_files:
-#         print(f'No condition files found in {output_dir}')
-#         return
-
-#     summary = {'conditions': {}}
-#     for f_path in condition_files:
-#         with open(f_path) as f:
-#             data = json.load(f)
-#         cond_name = data.get('condition', os.path.basename(f_path))
-#         summary['conditions'][cond_name] = data
-
-#     # Compute deltas vs baseline
-#     baseline = summary['conditions'].get('baseline', {})
-#     if baseline:
-#         for cond_name, cond_data in summary['conditions'].items():
-#             if cond_name == 'baseline':
-#                 continue
-#             deltas = {}
-#             if 'pope' in baseline and 'pope' in cond_data:
-#                 deltas['pope_accuracy_delta'] = round(
-#                     cond_data['pope']['accuracy'] - baseline['pope']['accuracy'], 4)
-#                 deltas['pope_f1_delta'] = round(
-#                     cond_data['pope']['f1'] - baseline['pope']['f1'], 4)
-#             if 'chair' in baseline and 'chair' in cond_data:
-#                 deltas['chair_i_delta'] = round(
-#                     cond_data['chair']['chair_i'] - baseline['chair']['chair_i'], 4)
-#                 deltas['chair_s_delta'] = round(
-#                     cond_data['chair']['chair_s'] - baseline['chair']['chair_s'], 4)
-#             cond_data['deltas_vs_baseline'] = deltas
-
-#     summary_path = os.path.join(output_dir, 'ablation_summary.json')
-#     with open(summary_path, 'w') as f:
-#         json.dump(summary, f, indent=2)
-
-#     print(f'\nAblation Summary')
-#     print(f'{"="*60}')
-#     for cond_name, cond_data in summary['conditions'].items():
-#         print(f'\n  {cond_name}:')
-#         n_abl = cond_data.get("n_neurons_ablated", 0)
-#         pct = cond_data.get("pct_neurons_ablated", "?")
-#         method = cond_data.get("ablation_method", "zero")
-#         top_n = cond_data.get("top_n", None)
-#         lr = cond_data.get("layer_range", None)
-#         print(f'    Neurons ablated: {n_abl} ({pct}%)  '
-#               f'method={method}  top_n={top_n}  layers={lr}')
-#         if 'pope' in cond_data:
-#             pope = cond_data['pope']
-#             print(f'    POPE accuracy: {pope["accuracy"]:.4f}  F1: {pope["f1"]:.4f}')
-#         if 'chair' in cond_data:
-#             chair = cond_data['chair']
-#             print(f'    CHAIR_i: {chair["chair_i"]:.4f}  CHAIR_s: {chair["chair_s"]:.4f}')
-#         if 'deltas_vs_baseline' in cond_data:
-#             d = cond_data['deltas_vs_baseline']
-#             parts = []
-#             for k, v in d.items():
-#                 parts.append(f'{k}={v:+.4f}')
-#             if parts:
-#                 print(f'    Δ vs baseline: {", ".join(parts)}')
-
-#     print(f'\nSaved → {summary_path}')
-
-
-# # ═══════════════════════════════════════════════════════════════════
-# # Section 9 — Main
-# # ═══════════════════════════════════════════════════════════════════
-
-# def main():
-#     args = parse_args()
-
-#     if args.merge:
-#         merge_results(args)
-#         return
-
-#     device = f'cuda:{args.device}' if args.device.isdigit() else args.device
-#     os.makedirs(args.output_dir, exist_ok=True)
-
-#     # ── Parse layer range ──
-#     layer_range = None
-#     if args.layer_range:
-#         parts = args.layer_range.split('-')
-#         layer_range = (int(parts[0]), int(parts[1]))
-#         print(f'Layer range filter: layers {layer_range[0]}–{layer_range[1]}')
-
-#     # ── Load neuron labels (with raw data for confidence ranking) ──
-#     print(f'Loading neuron labels from {args.labels_dir} ...')
-#     print(f'  Label source: {args.label_source}')
-#     labels_by_layer, raw_by_layer = load_neuron_labels(
-#         args.labels_dir, args.model_type,
-#         label_source=args.label_source)
-#     if not labels_by_layer:
-#         print(f'ERROR: No neuron labels found in {args.labels_dir}')
-#         sys.exit(1)
-
-#     n_layers_found = len(labels_by_layer)
-#     n_neurons_per_layer = len(next(iter(labels_by_layer.values())))
-#     print(f'  Loaded labels for {n_layers_found} layers, '
-#           f'{n_neurons_per_layer} neurons/layer')
-
-#     neuron_indices_by_type = get_neuron_indices_by_type(labels_by_layer)
-#     for label_type, layer_dict in neuron_indices_by_type.items():
-#         total = sum(len(v) for v in layer_dict.values())
-#         print(f'  {label_type:12s}: {total:6d} neurons across {len(layer_dict)} layers')
-
-#     # ── Build confidence rankings (for top_n / curve) ──
-#     ranked_neurons = get_ranked_neurons_by_type(
-#         raw_by_layer, args.label_source)
-#     for label_type, ranking in ranked_neurons.items():
-#         if ranking:
-#             top_score = ranking[0][2]
-#             bot_score = ranking[-1][2]
-#             print(f'  {label_type:12s} confidence: '
-#                   f'top={top_score:.4f}  bottom={bot_score:.4f}')
-
-#     # ── Load model ──
-#     print(f'\nLoading model ({args.model_type}) ...')
-#     if args.model_type == 'hf':
-#         model, processor, image_processor, image_token_id = load_model_hf(
-#             args.hf_id, device)
-#         tokenizer_or_processor = processor
-#     else:
-#         model, tokenizer, image_processor, image_token_id = load_model_original(
-#             args.original_model_path, device)
-#         tokenizer_or_processor = tokenizer
-#     print('  Model loaded.')
-
-#     # ── Compute CETT rankings (if requested) ──
-#     cett_scores = None
-#     if args.ranking_method == 'cett':
-#         cett_img_dir = args.pope_img_dir or args.chair_img_dir
-#         if cett_img_dir:
-#             cett_ranked, cett_scores = compute_cett_rankings(
-#                 model, args.model_type, tokenizer_or_processor,
-#                 image_processor, image_token_id,
-#                 cett_img_dir, labels_by_layer, device,
-#                 n_images=args.n_cett_images, seed=args.seed)
-
-#             # Override the label-based rankings with CETT-based rankings
-#             ranked_neurons = cett_ranked
-#             print(f'  Using CETT rankings (overriding label confidence)')
-
-#             # Save CETT scores for analysis
-#             cett_path = os.path.join(args.output_dir, 'cett_scores.json')
-#             cett_serializable = {
-#                 str(l): {str(n): float(v) for n, v in enumerate(scores)}
-#                 for l, scores in cett_scores.items()
-#             }
-#             with open(cett_path, 'w') as f:
-#                 json.dump(cett_serializable, f, indent=2)
-#             print(f'  Saved CETT scores → {cett_path}')
-#         else:
-#             print('  WARNING: No image dir for CETT computation. '
-#                   'Falling back to label-based ranking.')
-#             args.ranking_method = 'label'
-
-#     # ── Collect neuron stats (needed for mean/noise/clamp methods) ──
-#     neuron_stats = None
-#     if args.ablation_method != 'zero':
-#         stats_img_dir = args.pope_img_dir or args.chair_img_dir
-#         if stats_img_dir:
-#             neuron_stats = collect_neuron_stats(
-#                 model, args.model_type, tokenizer_or_processor,
-#                 image_processor, image_token_id,
-#                 stats_img_dir, device,
-#                 n_images=args.n_stats_images, seed=args.seed)
-#         else:
-#             print('  WARNING: No image dir available for stats collection. '
-#                   'Falling back to zero ablation for mean/noise/clamp.')
-#             args.ablation_method = 'zero'
-
-#     # ── Load POPE questions ──
-#     pope_questions = None
-#     if args.pope_path and os.path.isfile(args.pope_path):
-#         print(f'\nLoading POPE questions from {args.pope_path} ...')
-#         pope_questions = load_pope_questions(args.pope_path, args.pope_num_questions)
-#         print(f'  Loaded {len(pope_questions)} questions')
-
-#     # ── Load VQAv2 questions (overall) ──
-#     vqa_items = None
-#     if args.vqav2_questions and args.vqav2_annotations:
-#         if (os.path.isfile(args.vqav2_questions) and
-#                 os.path.isfile(args.vqav2_annotations)):
-#             print(f'\nLoading VQAv2 questions from {args.vqav2_questions} ...')
-#             vqa_items = load_vqav2(args.vqav2_questions,
-#                                    args.vqav2_annotations,
-#                                    num_questions=args.vqav2_num_questions,
-#                                    seed=args.seed)
-#             print(f'  Loaded {len(vqa_items)} VQAv2 questions')
-#         else:
-#             print(f'\n  [warn] VQAv2 files not found, skipping.')
-
-#     # ── Load VQA perception split ──
-#     vqa_perception_items = None
-#     if args.vqa_perception_questions and args.vqa_perception_annotations:
-#         if (os.path.isfile(args.vqa_perception_questions) and
-#                 os.path.isfile(args.vqa_perception_annotations)):
-#             print(f'\nLoading VQA-Perception from {args.vqa_perception_questions} ...')
-#             vqa_perception_items = load_vqav2(
-#                 args.vqa_perception_questions,
-#                 args.vqa_perception_annotations,
-#                 num_questions=None, seed=args.seed)
-#             print(f'  Loaded {len(vqa_perception_items)} perception questions')
-#         else:
-#             print(f'\n  [warn] VQA perception files not found, skipping.')
-
-#     # ── Load VQA knowledge split ──
-#     vqa_knowledge_items = None
-#     if args.vqa_knowledge_questions and args.vqa_knowledge_annotations:
-#         if (os.path.isfile(args.vqa_knowledge_questions) and
-#                 os.path.isfile(args.vqa_knowledge_annotations)):
-#             print(f'\nLoading VQA-Knowledge from {args.vqa_knowledge_questions} ...')
-#             vqa_knowledge_items = load_vqav2(
-#                 args.vqa_knowledge_questions,
-#                 args.vqa_knowledge_annotations,
-#                 num_questions=None, seed=args.seed)
-#             print(f'  Loaded {len(vqa_knowledge_items)} knowledge questions')
-#         else:
-#             print(f'\n  [warn] VQA knowledge files not found, skipping.')
-
-#     # ── Build list of (condition, top_n) runs ──
-#     # In curve mode, we sweep top_n for each condition
-#     if args.curve:
-#         curve_steps = [int(x) for x in args.curve_steps.split(',')]
-#         # Add 'all' (None) as the final step
-#         top_n_values = curve_steps + [None]
-#         print(f'\n  Curve mode: sweeping top_n = '
-#               f'{[str(x) for x in curve_steps]} + [all]')
-#     elif args.top_n is not None:
-#         top_n_values = [args.top_n]
-#     else:
-#         top_n_values = [None]  # None = ablate all neurons of the type
-
-#     # ── Run each (condition × top_n) combination ──
-#     for condition in args.conditions:
-#         for top_n in top_n_values:
-#             # Build a descriptive run name
-#             run_name = condition
-#             if top_n is not None:
-#                 run_name = f'{condition}_top{top_n}'
-#             if layer_range:
-#                 run_name = f'{run_name}_L{layer_range[0]}-{layer_range[1]}'
-#             if args.ablation_method != 'zero':
-#                 run_name = f'{run_name}_{args.ablation_method}'
-
-#             print(f'\n{"="*60}')
-#             print(f'CONDITION: {run_name}')
-#             print(f'{"="*60}')
-
-#             # Check if already done
-#             marker_path = os.path.join(args.output_dir,
-#                                        f'ablation_condition_{run_name}.json')
-#             if os.path.isfile(marker_path):
-#                 print(f'  [skip] Already complete — {marker_path}')
-#                 continue
-
-#             # Build ablation indices
-#             ablate_indices = build_ablation_indices(
-#                 condition, neuron_indices_by_type, labels_by_layer,
-#                 args.seed, top_n=top_n, layer_range=layer_range,
-#                 ranked_neurons=ranked_neurons)
-#             n_ablated = sum(len(v) for v in ablate_indices.values())
-#             n_layers_ablated = len(ablate_indices)
-#             pct = 100 * n_ablated / (n_layers_found * n_neurons_per_layer)
-#             print(f'  Ablating {n_ablated} neurons ({pct:.1f}%) '
-#                   f'across {n_layers_ablated} layers '
-#                   f'[method={args.ablation_method}]')
-
-#             # Register hooks
-#             handles = make_ablation_hooks(
-#                 model, args.model_type, ablate_indices,
-#                 method=args.ablation_method,
-#                 neuron_stats=neuron_stats, seed=args.seed)
-#             print(f'  Registered {len(handles)} ablation hooks')
-
-#             result = {
-#                 'condition': run_name,
-#                 'base_condition': condition,
-#                 'ablation_method': args.ablation_method,
-#                 'ranking_method': args.ranking_method,
-#                 'top_n': top_n,
-#                 'layer_range': list(layer_range) if layer_range else None,
-#                 'n_neurons_ablated': n_ablated,
-#                 'n_layers_ablated': n_layers_ablated,
-#                 'pct_neurons_ablated': round(pct, 2),
-#             }
-
-#             t0 = time.time()
-
-#             # POPE evaluation
-#             if pope_questions and args.pope_img_dir:
-#                 print(f'\n  Running POPE evaluation ({len(pope_questions)} questions) ...')
-#                 pope_result = evaluate_pope(
-#                     model, args.model_type, tokenizer_or_processor,
-#                     image_processor, image_token_id,
-#                     pope_questions, args.pope_img_dir, device)
-#                 result['pope'] = pope_result
-#                 print(f'  POPE: accuracy={pope_result["accuracy"]:.4f}  '
-#                       f'F1={pope_result["f1"]:.4f}  '
-#                       f'yes_ratio={pope_result["yes_ratio"]:.4f}')
-
-#             # CHAIR evaluation
-#             if args.chair_ann_path and args.chair_img_dir:
-#                 print(f'\n  Running CHAIR evaluation ({args.chair_num_images} images) ...')
-#                 chair_result = evaluate_chair(
-#                     model, args.model_type, tokenizer_or_processor,
-#                     image_processor, image_token_id,
-#                     args.chair_ann_path, args.chair_img_dir, device,
-#                     num_images=args.chair_num_images, seed=args.seed)
-#                 result['chair'] = chair_result
-#                 print(f'  CHAIR_i={chair_result["chair_i"]:.4f}  '
-#                       f'CHAIR_s={chair_result["chair_s"]:.4f}')
-
-#             # VQAv2 evaluation (overall)
-#             vqa_img = args.vqav2_img_dir or args.pope_img_dir              # Line V1: fallback to pope_img_dir
-#             if vqa_items and vqa_img:
-#                 print(f'\n  Running VQAv2 evaluation ({len(vqa_items)} questions) ...')
-#                 vqa_result = evaluate_vqav2(
-#                     model, args.model_type, tokenizer_or_processor,
-#                     image_processor, image_token_id,
-#                     vqa_items, vqa_img, device)
-#                 result['vqav2'] = vqa_result
-#                 print(f'  VQAv2: accuracy={vqa_result["accuracy"]:.4f}')
-
-#             # VQA-Perception evaluation
-#             if vqa_perception_items and vqa_img:                           # Line V2: reuse vqa_img
-#                 print(f'\n  Running VQA-Perception evaluation ({len(vqa_perception_items)} questions) ...')
-#                 vqa_perc_result = evaluate_vqav2(                          # Line V3: same eval function
-#                     model, args.model_type, tokenizer_or_processor,
-#                     image_processor, image_token_id,
-#                     vqa_perception_items, vqa_img, device)
-#                 result['vqa_perception'] = vqa_perc_result                 # Line V4: store under split key
-#                 print(f'  VQA-Perception: accuracy={vqa_perc_result["accuracy"]:.4f}')
-
-#             # VQA-Knowledge evaluation
-#             if vqa_knowledge_items and vqa_img:                            # Line V5: reuse vqa_img
-#                 print(f'\n  Running VQA-Knowledge evaluation ({len(vqa_knowledge_items)} questions) ...')
-#                 vqa_know_result = evaluate_vqav2(                          # Line V6: same eval function
-#                     model, args.model_type, tokenizer_or_processor,
-#                     image_processor, image_token_id,
-#                     vqa_knowledge_items, vqa_img, device)
-#                 result['vqa_knowledge'] = vqa_know_result                  # Line V7: store under split key
-#                 print(f'  VQA-Knowledge: accuracy={vqa_know_result["accuracy"]:.4f}')
-
-#             elapsed = time.time() - t0
-#             result['time_sec'] = round(elapsed, 1)
-
-#             # Remove hooks
-#             for h in handles:
-#                 h.remove()
-
-#             # Save per-condition result
-#             with open(marker_path, 'w') as f:
-#                 json.dump(result, f, indent=2)
-#             print(f'\n  Saved → {marker_path} ({elapsed:.1f}s)')
-
-#     # ── Auto-merge if all conditions ran in this process ──
-#     print(f'\n{"="*60}')
-#     print('Merging all condition results ...')
-#     merge_results(args)
-
-
-# if __name__ == '__main__':
-#     main()
-
-# # #!/usr/bin/env python3
-# # """
-# # neuron_ablation_validate.py — Ablation validation of neuron taxonomy
-
-# # Validates the neuron classification (visual / text / multimodal / unknown)
-# # by selectively ablating neurons of each type and measuring
-# # the impact on downstream tasks:
-
-# #   - POPE: Polling-based Object Probing Evaluation (yes/no accuracy + F1)
-# #   - CHAIR: Caption Hallucination Assessment with Image Relevance
-
-# # Implements 7 ablation approaches:
-
-# #   1. Ablation curve (--curve)
-# #      Sweep top_n = 100, 500, 1000, 5000, all neurons per type.
-# #      Shows whether a small set suffices or whether effect is distributed.
-
-# #   2. Layer-specific ablation (--layer_range 0-10)
-# #      Restrict ablation to a subset of layers to find where each
-# #      modality's neurons are most functionally important.
-
-# #   3. Mean ablation (--ablation_method mean)
-# #      Replace with per-neuron mean activation instead of zeroing.
-# #      Less disruptive — tests whether input-specific signal matters.
-
-# #   4. Noise ablation (--ablation_method noise)
-# #      Replace with N(mean, std) Gaussian noise per neuron.
-# #      Tests whether the neuron's specific signal matters vs any signal.
-# #      NOTE: Noise ablation can cause the model to generate endlessly when
-# #      activations are corrupted, leading to very long runtimes or timeouts.
-# #      Consider adding a max_new_tokens cap to keep generation bounded.
-
-# #   5. Activation clamping (--ablation_method clamp_high / clamp_low)
-# #      Set to 95th or 5th percentile. Tests direction of effect.
-
-# #   6. Neuron count matching (built into 'random' condition)
-# #      Random baseline always matches the targeted ablation count.
-# #      Controlled automatically when using --top_n or --curve.
-
-# #   7. Start small, scale up (--top_n 100 / --top_n 500 / --top_n 1000)
-# #      Rank neurons by classification confidence, ablate only the most
-# #      confident ones first. Equivalent to specific points on the curve.
-
-# #   8. CETT ranking (--ranking_method cett)
-# #      Ranks neurons by their actual impact on the layer output,
-# #      not just activation magnitude. For each neuron:
-# #      total_cett_j = mean_activation_j × ||down_proj[:, j]||
-# #      A neuron with high activation but tiny down_proj column has
-# #      low CETT (fires hard but the model ignores it). Same metric
-# #      for all neuron types — labels handle grouping, CETT handles
-# #      ordering within each group. Ablating higher-CETT neurons
-# #      first causes more disruption per neuron removed.
-
-# # Conditions:
-# #   baseline     — no ablation (original model)
-# #   ablate_text  — ablate text-classified neurons
-# #   ablate_vis   — ablate visual-classified neurons
-# #   ablate_multi — ablate multimodal-classified neurons
-# #   random       — ablate a random subset (matched count)
-
-# # Usage examples:
-# #     # Basic: all neurons, zero ablation
-# #     python neuron_ablation_validate.py --conditions baseline ablate_vis random
-
-# #     # Ablation curve: sweep top_n for visual neurons
-# #     python neuron_ablation_validate.py --curve \\
-# #         --conditions baseline ablate_vis random
-
-# #     # Top-100 most confident visual neurons with mean ablation
-# #     python neuron_ablation_validate.py --top_n 100 \\
-# #         --ablation_method mean --conditions baseline ablate_vis random
-
-# #     # Layer-specific: only layers 0-10
-# #     python neuron_ablation_validate.py --layer_range 0-10 \\
-# #         --conditions baseline ablate_vis ablate_text random
-
-# #     # CETT ranking with ablation curve
-# #     python neuron_ablation_validate.py --curve --ranking_method cett \\
-# #         --conditions baseline ablate_vis random
-
-# #     # Merge per-condition results:
-# #     python neuron_ablation_validate.py --merge --output_dir results/ablation/
-# # """
-
-# # import argparse
-# # import csv
-# # import json
-# # import glob
-# # import os
-# # import re
-# # import string
-# # import sys
-# # import time
-
-# # # Add LLaVA repo to path (needed for original model backend)
-# # _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-# # _LLAVA_PATH = os.path.join(_PROJECT_ROOT, 'LLaVA')
-# # if _LLAVA_PATH not in sys.path:
-# #     sys.path.insert(0, _LLAVA_PATH)
-
-# # import numpy as np
-# # import torch
-# # from PIL import Image
-# # from tqdm import tqdm
-
-
-# # # ═══════════════════════════════════════════════════════════════════
-# # # Section 1 — Label loading
-# # # ═══════════════════════════════════════════════════════════════════
-
-# # def load_neuron_labels(labels_dir, model_type='liuhaotian', n_layers=32,
-# #                        label_source='llm_permutation'):
-# #     """Load per-layer neuron labels from the classification output.
-
-# #     Args:
-# #         labels_dir: path to permutation/ or fixed_threshold/ dir
-# #         model_type: 'hf' or 'liuhaotian' — determines layer name prefix
-# #         n_layers: total number of LLM layers (32 for LLaVA-7B)
-# #         label_source: 'llm_permutation' or 'xu' — selects label filename
-
-# #     Returns:
-# #         labels_by_layer: dict {layer_idx: list of label strings}
-# #         raw_by_layer: dict {layer_idx: list of full neuron dicts}
-# #             Each dict has keys like neuron_idx, label, and confidence
-# #             fields (pv/pt/pm/pu for xu; p_value/observed_rate_diff
-# #             for permutation).
-# #     """
-# #     if model_type in ('hf',):
-# #         prefix = 'model.language_model.layers'
-# #     else:
-# #         prefix = 'model.layers'
-
-# #     # Select label filename based on source method
-# #     if label_source == 'llm_permutation':
-# #         label_filename = 'neuron_labels_permutation.json'
-# #     elif label_source == 'llm_pmbt':
-# #         label_filename = 'neuron_labels_pmbt.json'           # PMBT (Population-Median Binomial Test)
-# #     else:
-# #         label_filename = 'neuron_labels.json'
-
-# #     labels_by_layer = {}
-# #     raw_by_layer = {}
-# #     for layer_idx in range(n_layers):
-# #         layer_name = f'{prefix}.{layer_idx}.mlp.act_fn'
-# #         label_path = os.path.join(labels_dir, layer_name, label_filename)
-# #         if not os.path.isfile(label_path):
-# #             continue
-# #         with open(label_path) as f:
-# #             neuron_data = json.load(f)
-# #         labels_by_layer[layer_idx] = [n['label'] for n in neuron_data]
-# #         raw_by_layer[layer_idx] = neuron_data
-
-# #     return labels_by_layer, raw_by_layer
-
-
-# # def get_neuron_indices_by_type(labels_by_layer):
-# #     """Group neuron indices by their classification label.
-
-# #     Returns:
-# #         by_type: dict {label: dict {layer_idx: list of neuron indices}}
-# #     """
-# #     by_type = {'visual': {}, 'text': {}, 'multimodal': {}, 'unknown': {}}
-# #     for layer_idx, labels in labels_by_layer.items():
-# #         for label_type in by_type:
-# #             indices = [i for i, l in enumerate(labels) if l == label_type]
-# #             if indices:
-# #                 by_type[label_type][layer_idx] = indices
-# #     return by_type
-
-
-# # def get_confidence_score(neuron_dict, label_source='llm_permutation'):
-# #     """Extract a confidence score from a neuron's raw data dict.
-
-# #     For permutation labels: confidence = 1 - p_value (lower p → more
-# #     confident). Tie-break by |observed_rate_diff|.
-# #     For xu (fixed-threshold) labels: confidence = probability of the
-# #     assigned label (pv for visual, pt for text, pm for multimodal).
-
-# #     Args:
-# #         neuron_dict: single neuron dict from raw_by_layer
-# #         label_source: 'llm_permutation' or 'xu'
-
-# #     Returns:
-# #         float confidence score (higher = more confident classification)
-# #     """
-# #     label = neuron_dict['label']
-# #     if label_source in ('llm_permutation', 'llm_pmbt'):
-# #         # 1 - p_value gives a 0→1 confidence where 1 is most significant
-# #         return 1.0 - neuron_dict.get('p_value', 1.0)
-# #     else:
-# #         # xu labels store per-class probabilities pv/pt/pm/pu
-# #         prob_map = {'visual': 'pv', 'text': 'pt',
-# #                     'multimodal': 'pm', 'unknown': 'pu'}
-# #         key = prob_map.get(label, 'pu')
-# #         return neuron_dict.get(key, 0.0)
-
-
-# # def get_ranked_neurons_by_type(raw_by_layer, label_source='llm_permutation'):
-# #     """Rank all neurons of each type globally by confidence score.
-
-# #     Returns:
-# #         ranked: dict {label: list of (layer_idx, neuron_idx, score)}
-# #             Sorted descending by confidence score.
-# #     """
-# #     ranked = {'visual': [], 'text': [], 'multimodal': [], 'unknown': []}
-# #     for layer_idx, neuron_list in raw_by_layer.items():
-# #         for ndata in neuron_list:
-# #             label = ndata['label']
-# #             if label not in ranked:
-# #                 continue
-# #             score = get_confidence_score(ndata, label_source)
-# #             ranked[label].append((layer_idx, ndata['neuron_idx'], score))
-
-# #     # Sort each type by confidence descending
-# #     for label in ranked:
-# #         ranked[label].sort(key=lambda x: x[2], reverse=True)
-
-# #     return ranked
-
-
-# # def extract_down_proj_norms(model, model_type, n_layers=32):
-# #     """Extract the L2 norm of each column of the down_proj weight matrix.
-
-# #     In the LLaMA FFN computation:
-# #         gate = gate_proj(x)
-# #         up   = up_proj(x)
-# #         intermediate = silu(gate) * up          ← "neuron activations"
-# #         output = down_proj(intermediate)         ← projects back to residual
-
-# #     Each neuron j's actual contribution to the layer output is:
-# #         contribution_j = activation_j * down_proj[:, j]
-
-# #     The column norm ||down_proj[:, j]|| tells you how much the model
-# #     amplifies neuron j's signal. A neuron with large activation but
-# #     tiny down_proj column has low actual impact.
-
-# #     Args:
-# #         model: the LLaVA model
-# #         model_type: 'hf' or 'liuhaotian'
-# #         n_layers: number of LLM layers
-
-# #     Returns:
-# #         norms: dict {layer_idx: tensor of shape (n_neurons,)}
-# #             L2 norm of each down_proj column per layer.
-# #     """
-# #     norms = {}
-# #     for layer_idx in range(n_layers):
-# #         if model_type == 'hf':
-# #             layer = model.language_model.model.layers[layer_idx]
-# #         else:
-# #             layer = model.model.layers[layer_idx]
-
-# #         # down_proj weight shape: (hidden_size, intermediate_size)
-# #         # Column j = down_proj.weight[:, j] = the vector that neuron j
-# #         # projects into the residual stream
-# #         W_down = layer.mlp.down_proj.weight.detach().float()
-# #         # L2 norm of each column (dim=0 gives norm over hidden_size)
-# #         col_norms = W_down.norm(dim=0)  # shape: (intermediate_size,)
-# #         norms[layer_idx] = col_norms.cpu()
-
-# #     return norms
-
-
-# # def compute_cett_rankings(model, model_type, tokenizer_or_processor,
-# #                           image_processor, image_token_id,
-# #                           img_dir, labels_by_layer, device,
-# #                           n_images=30, n_layers=32, seed=42):
-# #     """Compute total CETT per neuron and return rankings.
-
-# #     CETT (Contribution to layer output) for neuron j:
-
-# #         total_cett_j = mean_activation_j × ||down_proj[:, j]||
-
-# #     mean_activation_j is averaged over all token positions and all
-# #     reference images. ||down_proj[:, j]|| is the L2 norm of column j
-# #     of the down_proj weight matrix — the model's architectural
-# #     amplification factor for neuron j.
-
-# #     This ranks neurons by their actual impact on the layer output.
-# #     A neuron with high activation but tiny down_proj column has low
-# #     CETT (fires hard but the model ignores it). A neuron with modest
-# #     activation but large down_proj column has high CETT (the model
-# #     amplifies its signal).
-
-# #     All neuron types (visual, text, multimodal) are ranked by the
-# #     same metric. The labels determine which group a neuron belongs
-# #     to; the total CETT determines its rank within that group.
-# #     Ablating higher-CETT neurons first causes more disruption to
-# #     the layer output.
-
-# #     Args:
-# #         model, model_type, tokenizer_or_processor, image_processor,
-# #             image_token_id: model components
-# #         img_dir: path to COCO val images
-# #         labels_by_layer: needed to know which neurons exist per layer
-# #         device: torch device string
-# #         n_images: reference images for CETT estimation
-# #         n_layers: number of LLM layers
-# #         seed: random seed
-
-# #     Returns:
-# #         cett_ranked: dict {label: [(layer_idx, neuron_idx, total_cett)]}
-# #             Same format as get_ranked_neurons_by_type(), scored by
-# #             total CETT. Sorted descending (highest contribution first).
-# #         cett_scores: dict {layer_idx: np.array of shape (n_neurons,)}
-# #             Total CETT per neuron per layer.
-# #     """
-# #     print('\n  Computing total CETT rankings ...')
-
-# #     # ── Step 1: Extract down_proj column norms (from weights) ──
-# #     print('    Extracting down_proj column norms ...')
-# #     down_norms = extract_down_proj_norms(model, model_type, n_layers)
-
-# #     # ── Step 2: Select reference images ──
-# #     rng = np.random.RandomState(seed)
-# #     img_files = sorted([f for f in os.listdir(img_dir)
-# #                         if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
-# #     if len(img_files) > n_images:
-# #         img_files = rng.choice(img_files, size=n_images,
-# #                                replace=False).tolist()
-
-# #     # ── Step 3: Register hooks to accumulate mean activations ──
-# #     act_sum = {}  # {layer: array (n_neurons,)} running sum of mean(act)
-# #     hooks = []
-
-# #     for layer_idx in sorted(labels_by_layer.keys()):
-# #         n_neurons = len(labels_by_layer[layer_idx])
-# #         act_sum[layer_idx] = np.zeros(n_neurons, dtype=np.float64)
-
-# #         if model_type == 'hf':
-# #             layer_mod = model.language_model.model.layers[layer_idx]
-# #         else:
-# #             layer_mod = model.model.layers[layer_idx]
-
-# #         act_fn = layer_mod.mlp.act_fn
-
-# #         # Only record from the first forward pass per image
-# #         # (model.generate calls forward multiple times for each token)
-# #         act_fn._cett_recorded = False
-
-# #         def make_hook(lidx, act_fn_ref):
-# #             def hook_fn(module, input, output):
-# #                 if act_fn_ref._cett_recorded:
-# #                     return
-# #                 # output shape: (1, seq_len, n_neurons)
-# #                 # Mean over all token positions → (n_neurons,)
-# #                 acts = output[0].detach().float().cpu().numpy()
-# #                 act_sum[lidx] += acts.mean(axis=0)
-# #                 act_fn_ref._cett_recorded = True
-# #             return hook_fn
-
-# #         h = act_fn.register_forward_hook(make_hook(layer_idx, act_fn))
-# #         hooks.append(h)
-
-# #     # ── Step 4: Run forward passes ──
-# #     n_processed = 0
-# #     print(f'    Running {len(img_files)} forward passes ...')
-
-# #     for img_file in tqdm(img_files, desc='CETT'):
-# #         img_path = os.path.join(img_dir, img_file)
-# #         try:
-# #             img = Image.open(img_path).convert('RGB')
-# #         except Exception:
-# #             continue
-
-# #         # Reset recording flags
-# #         for layer_idx in labels_by_layer:
-# #             if model_type == 'hf':
-# #                 act_fn = model.language_model.model.layers[layer_idx].mlp.act_fn
-# #             else:
-# #                 act_fn = model.model.layers[layer_idx].mlp.act_fn
-# #             act_fn._cett_recorded = False
-
-# #         # Prepare inputs and run forward pass
-# #         with torch.no_grad():
-# #             if model_type == 'hf':
-# #                 prompt = "USER: <image>\nDescribe this image.\nASSISTANT:"
-# #                 inputs = tokenizer_or_processor(
-# #                     images=img, text=prompt, return_tensors='pt').to(device)
-# #                 model.generate(**inputs, max_new_tokens=1, do_sample=False)
-# #             else:
-# #                 from llava.conversation import conv_templates
-# #                 from llava.constants import IMAGE_TOKEN_INDEX
-# #                 from llava.mm_utils import tokenizer_image_token
-
-# #                 conv = conv_templates["v1"].copy()
-# #                 conv.append_message(conv.roles[0],
-# #                                     "<image>\nDescribe this image.")
-# #                 conv.append_message(conv.roles[1], None)
-# #                 prompt = conv.get_prompt()
-
-# #                 input_ids = tokenizer_image_token(
-# #                     prompt, tokenizer_or_processor, IMAGE_TOKEN_INDEX,
-# #                     return_tensors='pt'
-# #                 ).unsqueeze(0).to(device)
-
-# #                 image_tensor = image_processor.preprocess(
-# #                     img, return_tensors='pt'
-# #                 )['pixel_values'].half().to(device)
-
-# #                 model.generate(input_ids, images=image_tensor,
-# #                                max_new_tokens=1, do_sample=False)
-
-# #         n_processed += 1
-
-# #     # ── Step 5: Remove hooks and clean up ──
-# #     for h in hooks:
-# #         h.remove()
-# #     for layer_idx in labels_by_layer:
-# #         if model_type == 'hf':
-# #             act_fn = model.language_model.model.layers[layer_idx].mlp.act_fn
-# #         else:
-# #             act_fn = model.model.layers[layer_idx].mlp.act_fn
-# #         if hasattr(act_fn, '_cett_recorded'):
-# #             delattr(act_fn, '_cett_recorded')
-
-# #     # ── Step 6: Compute total CETT per neuron ──
-# #     cett_scores = {}
-
-# #     for layer_idx in sorted(labels_by_layer.keys()):
-# #         dn = down_norms[layer_idx].numpy()
-# #         n_neurons = len(labels_by_layer[layer_idx])
-# #         dn = dn[:n_neurons]
-
-# #         # Total CETT = mean_activation × ||down_proj column||
-# #         mean_act = act_sum[layer_idx] / max(n_processed, 1)
-# #         cett_scores[layer_idx] = mean_act * dn
-
-# #     # ── Step 7: Build rankings (same metric for all groups) ──
-# #     cett_ranked = {'visual': [], 'text': [], 'multimodal': [], 'unknown': []}
-
-# #     for layer_idx, labels in labels_by_layer.items():
-# #         scores = cett_scores.get(layer_idx)
-# #         if scores is None:
-# #             continue
-# #         for nidx, label in enumerate(labels):
-# #             if label not in cett_ranked:
-# #                 continue
-# #             cett_ranked[label].append(
-# #                 (layer_idx, nidx, float(scores[nidx])))
-
-# #     # Sort each type by total CETT descending
-# #     for label in cett_ranked:
-# #         cett_ranked[label].sort(key=lambda x: x[2], reverse=True)
-
-# #     # Print summary
-# #     print(f'    Processed {n_processed} images')
-# #     for label in ['visual', 'text', 'multimodal']:
-# #         ranking = cett_ranked[label]
-# #         if ranking:
-# #             top = ranking[0]
-# #             print(f'    {label:12s} CETT top: layer={top[0]} '
-# #                   f'neuron={top[1]} score={top[2]:.6f}  '
-# #                   f'({len(ranking)} neurons)')
-
-# #     return cett_ranked, cett_scores
-
-
-# # # ═══════════════════════════════════════════════════════════════════
-# # # Section 2 — Model loading (reuses patterns from classification)
-# # # ═══════════════════════════════════════════════════════════════════
-
-# # def load_model_original(model_path, device):
-# #     """Load the original LLaVA model via the LLaVA repo."""
-# #     from llava.model.builder import load_pretrained_model
-# #     from llava.mm_utils import get_model_name_from_path
-# #     from llava.constants import IMAGE_TOKEN_INDEX
-
-# #     model_name = get_model_name_from_path(model_path)
-# #     tokenizer, model, image_processor, context_len = load_pretrained_model(
-# #         model_path, None, model_name, device_map=device,
-# #         torch_dtype=torch.float16
-# #     )
-# #     model.eval()
-# #     return model, tokenizer, image_processor, IMAGE_TOKEN_INDEX
-
-
-# # def load_model_hf(hf_id, device):
-# #     """Load the HuggingFace LLaVA model."""
-# #     from transformers import AutoProcessor, LlavaForConditionalGeneration
-
-# #     processor = AutoProcessor.from_pretrained(hf_id)
-# #     model = LlavaForConditionalGeneration.from_pretrained(
-# #         hf_id, torch_dtype=torch.float16, low_cpu_mem_usage=True
-# #     ).to(device).eval()
-# #     image_token_id = model.config.image_token_index
-# #     return model, processor, None, image_token_id
-
-
-# # # ═══════════════════════════════════════════════════════════════════
-# # # Section 3 — Ablation hooks
-# # # ═══════════════════════════════════════════════════════════════════
-
-# # def make_ablation_hooks(model, model_type, ablate_indices, n_layers=32,
-# #                         method='zero', neuron_stats=None, seed=42):
-# #     """Register forward hooks that ablate specified neurons at act_fn output.
-
-# #     Args:
-# #         model: the LLaVA model
-# #         model_type: 'hf' or 'liuhaotian'
-# #         ablate_indices: dict {layer_idx: list of neuron indices to ablate}
-# #         n_layers: total number of layers
-# #         method: ablation strategy —
-# #             'zero'       — set activations to 0 (default, most disruptive)
-# #             'mean'       — replace with per-neuron mean from reference data
-# #             'noise'      — replace with N(mean, std) random noise
-# #             'clamp_high' — clamp to 95th-percentile value
-# #             'clamp_low'  — clamp to 5th-percentile value
-# #         neuron_stats: dict {layer_idx: {neuron_idx: {'mean': float,
-# #             'std': float, 'p5': float, 'p95': float}}}
-# #             Required for mean/noise/clamp methods. Obtained from
-# #             collect_neuron_stats().
-# #         seed: random seed for noise method
-
-# #     Returns:
-# #         list of hook handles (call .remove() to deregister)
-# #     """
-# #     handles = []
-# #     rng = torch.Generator()
-# #     rng.manual_seed(seed)
-
-# #     for layer_idx, neuron_indices in ablate_indices.items():
-# #         if not neuron_indices:
-# #             continue
-
-# #         indices_tensor = torch.tensor(neuron_indices, dtype=torch.long)
-
-# #         # Pre-compute replacement values per neuron for this layer
-# #         replacement_vals = None
-# #         if method in ('mean', 'noise', 'clamp_high', 'clamp_low') and neuron_stats:
-# #             layer_stats = neuron_stats.get(layer_idx, {})
-# #             vals = []
-# #             for nidx in neuron_indices:
-# #                 ns = layer_stats.get(nidx, {'mean': 0.0, 'std': 1.0,
-# #                                              'p5': 0.0, 'p95': 0.0})
-# #                 if method == 'mean':
-# #                     vals.append(ns['mean'])
-# #                 elif method == 'clamp_high':
-# #                     vals.append(ns['p95'])
-# #                 elif method == 'clamp_low':
-# #                     vals.append(ns['p5'])
-# #                 else:  # noise — store mean and std for runtime sampling
-# #                     vals.append((ns['mean'], ns['std']))
-# #             if method != 'noise':
-# #                 replacement_vals = torch.tensor(vals, dtype=torch.float16)
-
-# #         # Get the act_fn module
-# #         if model_type == 'hf':
-# #             layer = model.language_model.model.layers[layer_idx]
-# #         else:
-# #             layer = model.model.layers[layer_idx]
-
-# #         act_fn = layer.mlp.act_fn
-
-# #         def hook_fn(module, input, output, _indices=indices_tensor,
-# #                     _method=method, _repl=replacement_vals,
-# #                     _noise_params=vals if method == 'noise' else None):
-# #             device = output.device
-# #             idx = _indices.to(device)
-
-# #             if _method == 'zero':
-# #                 # Set activations to exactly 0
-# #                 output[:, :, idx] = 0.0
-
-# #             elif _method in ('mean', 'clamp_high', 'clamp_low'):
-# #                 # Replace with pre-computed constant per neuron
-# #                 # _repl shape: (n_neurons,) → broadcast over (batch, seq)
-# #                 output[:, :, idx] = _repl.to(device)
-
-# #             elif _method == 'noise':
-# #                 # Replace with Gaussian noise ~ N(mean, std) per neuron
-# #                 for i, nidx in enumerate(idx):
-# #                     mu, sigma = _noise_params[i]
-# #                     noise = torch.randn(
-# #                         output[:, :, nidx].shape,
-# #                         device=device, dtype=output.dtype
-# #                     ) * sigma + mu
-# #                     output[:, :, nidx] = noise
-
-# #             return output
-
-# #         h = act_fn.register_forward_hook(hook_fn)
-# #         handles.append(h)
-
-# #     return handles
-
-
-# # def build_ablation_indices(condition, neuron_indices_by_type, labels_by_layer,
-# #                            seed=42, top_n=None, layer_range=None,
-# #                            ranked_neurons=None):
-# #     """Build the dict of {layer_idx: [neuron_indices]} for a given condition.
-
-# #     Args:
-# #         condition: one of 'baseline', 'ablate_text', 'ablate_vis',
-# #                    'ablate_multi', 'random'
-# #         neuron_indices_by_type: output of get_neuron_indices_by_type()
-# #         labels_by_layer: output of load_neuron_labels()
-# #         seed: random seed for 'random' condition
-# #         top_n: if set, only ablate the top N most confident neurons
-# #             of the target type (ranked by classification confidence).
-# #             Requires ranked_neurons to be provided.
-# #         layer_range: tuple (start, end) — only ablate neurons in
-# #             layers[start:end+1]. None means all layers.
-# #         ranked_neurons: output of get_ranked_neurons_by_type() —
-# #             needed when top_n is set.
-
-# #     Returns:
-# #         dict {layer_idx: list of neuron indices to ablate}
-# #     """
-# #     if condition == 'baseline':
-# #         return {}
-
-# #     type_map = {
-# #         'ablate_text': 'text',
-# #         'ablate_vis': 'visual',
-# #         'ablate_multi': 'multimodal',
-# #     }
-
-# #     if condition in type_map:
-# #         target_type = type_map[condition]
-
-# #         # ── Top-N mode: pick N most confident neurons globally ──
-# #         if top_n is not None and ranked_neurons is not None:
-# #             ranking = ranked_neurons.get(target_type, [])
-# #             selected = ranking[:top_n]  # already sorted by confidence desc
-# #             ablate = {}
-# #             for lay, nidx, score in selected:
-# #                 # Apply layer range filter
-# #                 if layer_range and not (layer_range[0] <= lay <= layer_range[1]):
-# #                     continue
-# #                 ablate.setdefault(lay, []).append(nidx)
-# #             return ablate
-
-# #         # ── Full ablation (all neurons of this type) ──
-# #         full = dict(neuron_indices_by_type.get(target_type, {}))
-# #         if layer_range:
-# #             return {l: v for l, v in full.items()
-# #                     if layer_range[0] <= l <= layer_range[1]}
-# #         return full
-
-# #     if condition == 'random':
-# #         # Match the size of the LARGEST targeted ablation in this run
-# #         # (or text neurons if nothing else specified)
-# #         rng = np.random.RandomState(seed)
-# #         ablate = {}
-# #         text_indices = neuron_indices_by_type.get('text', {})
-# #         for layer_idx, labels in labels_by_layer.items():
-# #             if layer_range and not (layer_range[0] <= layer_idx <= layer_range[1]):
-# #                 continue
-# #             n_to_ablate = len(text_indices.get(layer_idx, []))
-# #             if top_n is not None:
-# #                 # For top_n mode, match the total count across all layers
-# #                 # We'll compute this below after the loop
-# #                 pass
-# #             if n_to_ablate > 0:
-# #                 all_indices = list(range(len(labels)))
-# #                 chosen = rng.choice(all_indices, size=min(n_to_ablate, len(all_indices)),
-# #                                     replace=False).tolist()
-# #                 ablate[layer_idx] = chosen
-
-# #         # If top_n is set, adjust random count to match the targeted total
-# #         if top_n is not None and ranked_neurons is not None:
-# #             # Find how many neurons are actually ablated in the corresponding
-# #             # targeted condition (use 'visual' as reference)
-# #             ref_type = 'visual'
-# #             ref_ranking = ranked_neurons.get(ref_type, [])
-# #             ref_selected = ref_ranking[:top_n]
-# #             if layer_range:
-# #                 ref_selected = [(l, n, s) for l, n, s in ref_selected
-# #                                 if layer_range[0] <= l <= layer_range[1]]
-# #             target_total = len(ref_selected)
-
-# #             # Redistribute randomly across layers
-# #             rng2 = np.random.RandomState(seed)
-# #             ablate = {}
-# #             valid_layers = [l for l in labels_by_layer
-# #                             if not layer_range or
-# #                             (layer_range[0] <= l <= layer_range[1])]
-# #             if valid_layers and target_total > 0:
-# #                 n_per_layer = len(next(iter(labels_by_layer.values())))
-# #                 total_pool = len(valid_layers) * n_per_layer
-# #                 remaining = min(target_total, total_pool)
-# #                 # Spread evenly then sample
-# #                 per_layer = remaining // len(valid_layers)
-# #                 extra = remaining % len(valid_layers)
-# #                 for i, lay in enumerate(sorted(valid_layers)):
-# #                     n_this = per_layer + (1 if i < extra else 0)
-# #                     if n_this > 0:
-# #                         all_idx = list(range(len(labels_by_layer[lay])))
-# #                         chosen = rng2.choice(all_idx,
-# #                                              size=min(n_this, len(all_idx)),
-# #                                              replace=False).tolist()
-# #                         ablate[lay] = chosen
-
-# #         return ablate
-
-# #     raise ValueError(f'Unknown condition: {condition}')
-
-
-# # # ═══════════════════════════════════════════════════════════════════
-# # # Section 3b — Neuron statistics collection (for mean/noise/clamp)
-# # # ═══════════════════════════════════════════════════════════════════
-
-# # def collect_neuron_stats(model, model_type, tokenizer_or_processor,
-# #                          image_processor, image_token_id,
-# #                          img_dir, device, n_images=50, n_layers=32,
-# #                          seed=42):
-# #     """Run reference images through the model and collect activation stats.
-
-# #     Records mean, std, 5th/95th percentile of each neuron's post-act_fn
-# #     activation across all positions and images. These stats are used by
-# #     mean/noise/clamp ablation methods.
-
-# #     Args:
-# #         model, model_type, tokenizer_or_processor, image_processor,
-# #             image_token_id: model components (same as evaluation)
-# #         img_dir: path to directory of reference images (COCO val)
-# #         device: torch device string
-# #         n_images: how many reference images to use (50 is sufficient)
-# #         n_layers: number of LLM layers
-# #         seed: for reproducible image sampling
-
-# #     Returns:
-# #         neuron_stats: dict {layer_idx: {neuron_idx: {
-# #             'mean': float, 'std': float, 'p5': float, 'p95': float}}}
-# #     """
-# #     print(f'  Collecting neuron activation stats from {n_images} images ...')
-
-# #     # Find reference images
-# #     rng = np.random.RandomState(seed)
-# #     img_files = sorted([f for f in os.listdir(img_dir)
-# #                         if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
-# #     if len(img_files) > n_images:
-# #         img_files = rng.choice(img_files, size=n_images,
-# #                                replace=False).tolist()
-
-# #     # Register recording hooks on every layer's act_fn
-# #     # Collect per-layer running statistics using Welford's algorithm
-# #     # to avoid storing all activations in memory
-# #     layer_accumulators = {}
-# #     hooks = []
-
-# #     for layer_idx in range(n_layers):
-# #         if model_type == 'hf':
-# #             layer = model.language_model.model.layers[layer_idx]
-# #         else:
-# #             layer = model.model.layers[layer_idx]
-
-# #         act_fn = layer.mlp.act_fn
-
-# #         # Each accumulator tracks: count, mean, M2, min-heap, max-heap
-# #         acc = {
-# #             'count': 0,
-# #             'mean': None,
-# #             'M2': None,
-# #             'all_vals': [],  # store a subsample for percentiles
-# #         }
-# #         layer_accumulators[layer_idx] = acc
-
-# #         def make_hook(acc_ref, lidx):
-# #             def hook_fn(module, input, output):
-# #                 # output: (batch, seq_len, n_neurons)
-# #                 # Average over batch and seq dimensions
-# #                 vals = output.detach().float()
-# #                 # Mean over batch and sequence → (n_neurons,)
-# #                 batch_mean = vals.mean(dim=(0, 1)).cpu().numpy()
-
-# #                 if acc_ref['mean'] is None:
-# #                     acc_ref['mean'] = np.zeros_like(batch_mean)
-# #                     acc_ref['M2'] = np.zeros_like(batch_mean)
-
-# #                 acc_ref['count'] += 1
-# #                 delta = batch_mean - acc_ref['mean']
-# #                 acc_ref['mean'] += delta / acc_ref['count']
-# #                 delta2 = batch_mean - acc_ref['mean']
-# #                 acc_ref['M2'] += delta * delta2
-
-# #                 # Store subsample for percentile estimation (first 20 images)
-# #                 if acc_ref['count'] <= 20:
-# #                     acc_ref['all_vals'].append(batch_mean.copy())
-
-# #             return hook_fn
-
-# #         h = act_fn.register_forward_hook(make_hook(acc, layer_idx))
-# #         hooks.append(h)
-
-# #     # Run forward passes
-# #     prompt = "Describe this image briefly."
-# #     for img_file in tqdm(img_files, desc='Stats collection'):
-# #         img_path = os.path.join(img_dir, img_file)
-# #         try:
-# #             img = Image.open(img_path).convert('RGB')
-# #         except Exception:
-# #             continue
-
-# #         # Simple forward pass (just generation of a few tokens)
-# #         generate_answer(model, model_type, tokenizer_or_processor,
-# #                         image_processor, image_token_id,
-# #                         img, prompt, device, max_new_tokens=5)
-
-# #     # Remove recording hooks
-# #     for h in hooks:
-# #         h.remove()
-
-# #     # Build stats dict
-# #     neuron_stats = {}
-# #     for layer_idx, acc in layer_accumulators.items():
-# #         if acc['mean'] is None or acc['count'] < 2:
-# #             continue
-
-# #         variance = acc['M2'] / max(acc['count'] - 1, 1)
-# #         std = np.sqrt(np.maximum(variance, 0.0))
-
-# #         # Compute percentiles from subsample
-# #         if acc['all_vals']:
-# #             stacked = np.stack(acc['all_vals'])  # (n_samples, n_neurons)
-# #             p5 = np.percentile(stacked, 5, axis=0)
-# #             p95 = np.percentile(stacked, 95, axis=0)
-# #         else:
-# #             p5 = acc['mean'] - 1.645 * std
-# #             p95 = acc['mean'] + 1.645 * std
-
-# #         layer_stats = {}
-# #         n_neurons = len(acc['mean'])
-# #         for nidx in range(n_neurons):
-# #             layer_stats[nidx] = {
-# #                 'mean': float(acc['mean'][nidx]),
-# #                 'std': float(std[nidx]),
-# #                 'p5': float(p5[nidx]),
-# #                 'p95': float(p95[nidx]),
-# #             }
-# #         neuron_stats[layer_idx] = layer_stats
-
-# #     print(f'  Collected stats for {len(neuron_stats)} layers '
-# #           f'({acc["count"]} images processed)')
-# #     return neuron_stats
-
-
-# # # ═══════════════════════════════════════════════════════════════════
-# # # Section 4 — POPE evaluation
-# # # ═══════════════════════════════════════════════════════════════════
-
-# # def load_pope_questions(pope_path, num_questions=None):
-# #     """Load POPE questions from JSONL file.
-
-# #     Returns list of dicts with keys: question_id, image, text, label
-# #     """
-# #     questions = []
-# #     with open(pope_path) as f:
-# #         for line in f:
-# #             line = line.strip()
-# #             if not line:
-# #                 continue
-# #             q = json.loads(line)
-# #             questions.append(q)
-# #     if num_questions is not None and num_questions < len(questions):
-# #         questions = questions[:num_questions]
-# #     return questions
-
-
-# # def evaluate_pope(model, model_type, tokenizer_or_processor, image_processor,
-# #                   image_token_id, questions, img_dir, device):
-# #     """Run POPE evaluation: ask yes/no questions, measure accuracy + F1.
-
-# #     Returns dict with accuracy, precision, recall, f1, yes_ratio, n_questions.
-# #     """
-# #     correct = 0
-# #     tp = fp = fn = tn = 0
-# #     total = 0
-# #     n_yes_pred = 0
-
-# #     for q in tqdm(questions, desc='POPE eval'):
-# #         img_path = os.path.join(img_dir, q['image'])
-# #         if not os.path.isfile(img_path):
-# #             continue
-
-# #         try:
-# #             img = Image.open(img_path).convert('RGB')
-# #         except Exception:
-# #             continue
-
-# #         question_text = q['text']
-# #         gt_label = q['label'].strip().lower()
-
-# #         # Generate answer (POPE is yes/no, so 10 tokens is plenty)
-# #         answer = generate_answer(model, model_type, tokenizer_or_processor,
-# #                                  image_processor, image_token_id,
-# #                                  img, question_text, device,
-# #                                  max_new_tokens=10)
-# #         answer_lower = answer.strip().lower()
-
-# #         # Parse yes/no
-# #         pred_yes = answer_lower.startswith('yes')
-# #         gt_yes = gt_label == 'yes'
-
-# #         if pred_yes == gt_yes:
-# #             correct += 1
-# #         if pred_yes and gt_yes:
-# #             tp += 1
-# #         elif pred_yes and not gt_yes:
-# #             fp += 1
-# #         elif not pred_yes and gt_yes:
-# #             fn += 1
-# #         else:
-# #             tn += 1
-
-# #         if pred_yes:
-# #             n_yes_pred += 1
-# #         total += 1
-
-# #     accuracy = correct / max(total, 1)
-# #     precision = tp / max(tp + fp, 1)
-# #     recall = tp / max(tp + fn, 1)
-# #     f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-# #     yes_ratio = n_yes_pred / max(total, 1)
-
-# #     return {
-# #         'accuracy': round(accuracy, 4),
-# #         'precision': round(precision, 4),
-# #         'recall': round(recall, 4),
-# #         'f1': round(f1, 4),
-# #         'yes_ratio': round(yes_ratio, 4),
-# #         'n_questions': total,
-# #         'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
-# #     }
-
-
-# # # ═══════════════════════════════════════════════════════════════════
-# # # Section 5 — CHAIR evaluation
-# # # ═══════════════════════════════════════════════════════════════════
-
-# # def load_coco_objects(ann_path):
-# #     """Load COCO instance annotations → {image_id: set of category names}."""
-# #     with open(ann_path) as f:
-# #         data = json.load(f)
-# #     cat_id_to_name = {c['id']: c['name'] for c in data['categories']}
-# #     image_objects = {}
-# #     for ann in data['annotations']:
-# #         img_id = ann['image_id']
-# #         cat_name = cat_id_to_name[ann['category_id']]
-# #         image_objects.setdefault(img_id, set()).add(cat_name.lower())
-# #     return image_objects, cat_id_to_name
-
-
-# # def evaluate_chair(model, model_type, tokenizer_or_processor, image_processor,
-# #                    image_token_id, ann_path, img_dir, device,
-# #                    num_images=500, seed=42):
-# #     """Run CHAIR evaluation: generate captions, measure object hallucination.
-
-# #     CHAIR_i = hallucinated objects / total mentioned objects
-# #     CHAIR_s = sentences with hallucination / total sentences
-
-# #     Returns dict with chair_i, chair_s, n_images, avg_caption_len.
-# #     """
-# #     image_objects, cat_id_to_name = load_coco_objects(ann_path)
-# #     all_cat_names = set(n.lower() for n in cat_id_to_name.values())
-
-# #     # Get image filenames
-# #     with open(ann_path) as f:
-# #         data = json.load(f)
-# #     id_to_filename = {img['id']: img['file_name'] for img in data['images']}
-
-# #     # Sample images that have annotations
-# #     rng = np.random.RandomState(seed)
-# #     valid_ids = [iid for iid in image_objects if iid in id_to_filename]
-# #     if num_images < len(valid_ids):
-# #         chosen_ids = rng.choice(valid_ids, size=num_images, replace=False).tolist()
-# #     else:
-# #         chosen_ids = valid_ids
-
-# #     total_objects_mentioned = 0
-# #     total_hallucinated = 0
-# #     total_sentences = 0
-# #     sentences_with_hallucination = 0
-# #     total_caption_len = 0
-
-# #     for img_id in tqdm(chosen_ids, desc='CHAIR eval'):
-# #         filename = id_to_filename[img_id]
-# #         img_path = os.path.join(img_dir, filename)
-# #         if not os.path.isfile(img_path):
-# #             continue
-
-# #         try:
-# #             img = Image.open(img_path).convert('RGB')
-# #         except Exception:
-# #             continue
-
-# #         # Generate caption (100 tokens is plenty for a description)
-# #         caption = generate_answer(model, model_type, tokenizer_or_processor,
-# #                                   image_processor, image_token_id,
-# #                                   img, "Could you describe the image?", device,
-# #                                   max_new_tokens=100)
-
-# #         gt_objects = image_objects.get(img_id, set())
-# #         total_caption_len += len(caption.split())
-
-# #         # Check each sentence for hallucinated objects
-# #         sentences = [s.strip() for s in caption.replace('\n', '.').split('.')
-# #                      if s.strip()]
-# #         for sentence in sentences:
-# #             sentence_lower = sentence.lower()
-# #             total_sentences += 1
-# #             sentence_has_hallucination = False
-
-# #             for cat_name in all_cat_names:
-# #                 if cat_name in sentence_lower:
-# #                     total_objects_mentioned += 1
-# #                     if cat_name not in gt_objects:
-# #                         total_hallucinated += 1
-# #                         sentence_has_hallucination = True
-
-# #             if sentence_has_hallucination:
-# #                 sentences_with_hallucination += 1
-
-# #     chair_i = total_hallucinated / max(total_objects_mentioned, 1)
-# #     chair_s = sentences_with_hallucination / max(total_sentences, 1)
-# #     avg_len = total_caption_len / max(len(chosen_ids), 1)
-
-# #     return {
-# #         'chair_i': round(chair_i, 4),
-# #         'chair_s': round(chair_s, 4),
-# #         'n_images': len(chosen_ids),
-# #         'total_objects_mentioned': total_objects_mentioned,
-# #         'total_hallucinated': total_hallucinated,
-# #         'total_sentences': total_sentences,
-# #         'sentences_with_hallucination': sentences_with_hallucination,
-# #         'avg_caption_len': round(avg_len, 1),
-# #     }
-
-
-# # # ═══════════════════════════════════════════════════════════════════
-# # # Section 6 — Generation helper
-# # # ═══════════════════════════════════════════════════════════════════
-
-# # def generate_answer(model, model_type, tokenizer_or_processor, image_processor,
-# #                     image_token_id, img, question, device, max_new_tokens=512):
-# #     """Generate a text answer for an image + question.
-
-# #     Handles both HF and original LLaVA backends.
-# #     """
-# #     with torch.no_grad():
-# #         if model_type == 'hf':
-# #             prompt = f"USER: <image>\n{question}\nASSISTANT:"
-# #             inputs = tokenizer_or_processor(
-# #                 images=img, text=prompt, return_tensors='pt'
-# #             ).to(device)
-# #             output_ids = model.generate(
-# #                 **inputs,
-# #                 max_new_tokens=max_new_tokens,
-# #                 do_sample=False,
-# #             )
-# #             # Decode only the generated tokens (skip the prompt)
-# #             prompt_len = inputs['input_ids'].shape[1]
-# #             answer = tokenizer_or_processor.decode(
-# #                 output_ids[0][prompt_len:], skip_special_tokens=True)
-# #         else:
-# #             from llava.conversation import conv_templates
-# #             from llava.constants import IMAGE_TOKEN_INDEX
-# #             from llava.mm_utils import tokenizer_image_token
-
-# #             conv = conv_templates["v1"].copy()
-# #             conv.append_message(conv.roles[0], f"<image>\n{question}")
-# #             conv.append_message(conv.roles[1], None)
-# #             prompt = conv.get_prompt()
-
-# #             input_ids = tokenizer_image_token(
-# #                 prompt, tokenizer_or_processor, IMAGE_TOKEN_INDEX,
-# #                 return_tensors='pt'
-# #             ).unsqueeze(0).to(device)
-
-# #             image_tensor = image_processor.preprocess(
-# #                 img, return_tensors='pt'
-# #             )['pixel_values'].half().to(device)
-
-# #             output_ids = model.generate(
-# #                 input_ids,
-# #                 images=image_tensor,
-# #                 max_new_tokens=max_new_tokens,
-# #                 do_sample=False,
-# #             )
-# #             answer = tokenizer_or_processor.decode(
-# #                 output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
-
-# #     return answer.strip()
-
-
-
-# # # ═══════════════════════════════════════════════════════════════════
-# # # Section 7 — Argument parsing
-# # # ═══════════════════════════════════════════════════════════════════
-
-# # def parse_args():
-# #     p = argparse.ArgumentParser(
-# #         description='Ablation validation of neuron taxonomy')
-
-# #     # Model
-# #     p.add_argument('--model_type', default='liuhaotian',
-# #                    choices=['hf', 'liuhaotian'])
-# #     p.add_argument('--original_model_path', default='liuhaotian/llava-v1.5-7b')
-# #     p.add_argument('--hf_id', default='llava-hf/llava-1.5-7b-hf')
-
-# #     # Labels
-# #     p.add_argument('--labels_dir', required=False,
-# #                    help='Directory with permutation-test neuron labels')
-
-# #     # Output
-# #     p.add_argument('--output_dir', default='results/ablation')
-
-# #     # Ablation conditions
-# #     p.add_argument('--conditions', nargs='+',
-# #                    default=['baseline', 'ablate_text', 'ablate_vis',
-# #                             'ablate_multi', 'random'],
-# #                    help='Ablation conditions to run')
-# #     p.add_argument('--num_images', type=int, default=100,
-# #                    help='Number of images for evaluation')
-
-# #     # POPE
-# #     p.add_argument('--pope_path', default=None,
-# #                    help='Path to POPE JSONL file')
-# #     p.add_argument('--pope_img_dir', default=None,
-# #                    help='Path to COCO val images for POPE')
-# #     p.add_argument('--pope_num_questions', type=int, default=None,
-# #                    help='Limit number of POPE questions (for testing)')
-
-# #     # CHAIR
-# #     p.add_argument('--chair_ann_path', default=None,
-# #                    help='Path to instances_val2014.json for CHAIR')
-# #     p.add_argument('--chair_img_dir', default=None,
-# #                    help='Path to COCO val images for CHAIR')
-# #     p.add_argument('--chair_num_images', type=int, default=500)
-
-
-
-# #     # Device
-# #     p.add_argument('--device', default='0')
-# #     p.add_argument('--seed', type=int, default=42)
-# #     p.add_argument('--label_source', default='llm_permutation',
-# #                    choices=['llm_permutation', 'xu', 'llm_pmbt'],
-# #                    help='Which labels to use: permutation, xu (fixed-threshold), '
-# #                         'or pmbt (Population-Median Binomial Test)')
-
-# #     # ── Advanced ablation options (8 approaches) ──
-# #     p.add_argument('--ablation_method', default='zero',
-# #                    choices=['zero', 'mean', 'noise', 'clamp_high', 'clamp_low'],
-# #                    help='How to ablate neurons: zero (set to 0), mean (replace '
-# #                         'with dataset mean), noise (Gaussian noise matching '
-# #                         'neuron stats), clamp_high (set to 95th percentile), '
-# #                         'clamp_low (set to 5th percentile)')
-# #     p.add_argument('--top_n', type=int, default=None,
-# #                    help='Ablate only the top N most confident neurons per type '
-# #                         '(for start-small-scale-up / ablation curve)')
-# #     p.add_argument('--layer_range', default=None,
-# #                    help='Only ablate neurons in this layer range, e.g. "0-10" '
-# #                         'or "22-31" (for layer-specific ablation)')
-# #     p.add_argument('--curve', action='store_true',
-# #                    help='Run full ablation curve: sweep top_n over multiple '
-# #                         'values (100,500,1000,5000,all) for each condition')
-# #     p.add_argument('--curve_steps', default='100,500,1000,5000',
-# #                    help='Comma-separated top_n values for --curve sweep '
-# #                         '(default: 100,500,1000,5000)')
-# #     p.add_argument('--n_stats_images', type=int, default=50,
-# #                    help='Number of reference images for computing neuron '
-# #                         'activation stats (mean/noise/clamp methods)')
-# #     p.add_argument('--ranking_method', default='label',
-# #                    choices=['label', 'cett'],
-# #                    help='How to rank neurons for top_n / curve selection: '
-# #                         '"label" uses classification confidence (1-p_value or '
-# #                         'class probability), "cett" uses total CETT = '
-# #                         'mean_activation × ||down_proj column||, ranking by '
-# #                         'actual impact on layer output')
-# #     p.add_argument('--n_cett_images', type=int, default=30,
-# #                    help='Number of reference images for CETT computation')
-
-# #     # Merge mode
-# #     p.add_argument('--merge', action='store_true',
-# #                    help='Merge per-condition results into summary, then exit')
-
-# #     return p.parse_args()
-
-
-# # # ═══════════════════════════════════════════════════════════════════
-# # # Section 8 — Merge
-# # # ═══════════════════════════════════════════════════════════════════
-
-# # def merge_results(args):
-# #     """Merge per-condition ablation results into a single summary."""
-# #     output_dir = args.output_dir
-# #     condition_files = sorted(glob.glob(
-# #         os.path.join(output_dir, 'ablation_condition_*.json')))
-
-# #     if not condition_files:
-# #         print(f'No condition files found in {output_dir}')
-# #         return
-
-# #     summary = {'conditions': {}}
-# #     for f_path in condition_files:
-# #         with open(f_path) as f:
-# #             data = json.load(f)
-# #         cond_name = data.get('condition', os.path.basename(f_path))
-# #         summary['conditions'][cond_name] = data
-
-# #     # Compute deltas vs baseline
-# #     baseline = summary['conditions'].get('baseline', {})
-# #     if baseline:
-# #         for cond_name, cond_data in summary['conditions'].items():
-# #             if cond_name == 'baseline':
-# #                 continue
-# #             deltas = {}
-# #             if 'pope' in baseline and 'pope' in cond_data:
-# #                 deltas['pope_accuracy_delta'] = round(
-# #                     cond_data['pope']['accuracy'] - baseline['pope']['accuracy'], 4)
-# #                 deltas['pope_f1_delta'] = round(
-# #                     cond_data['pope']['f1'] - baseline['pope']['f1'], 4)
-# #             if 'chair' in baseline and 'chair' in cond_data:
-# #                 deltas['chair_i_delta'] = round(
-# #                     cond_data['chair']['chair_i'] - baseline['chair']['chair_i'], 4)
-# #                 deltas['chair_s_delta'] = round(
-# #                     cond_data['chair']['chair_s'] - baseline['chair']['chair_s'], 4)
-# #             cond_data['deltas_vs_baseline'] = deltas
-
-# #     summary_path = os.path.join(output_dir, 'ablation_summary.json')
-# #     with open(summary_path, 'w') as f:
-# #         json.dump(summary, f, indent=2)
-
-# #     print(f'\nAblation Summary')
-# #     print(f'{"="*60}')
-# #     for cond_name, cond_data in summary['conditions'].items():
-# #         print(f'\n  {cond_name}:')
-# #         n_abl = cond_data.get("n_neurons_ablated", 0)
-# #         pct = cond_data.get("pct_neurons_ablated", "?")
-# #         method = cond_data.get("ablation_method", "zero")
-# #         top_n = cond_data.get("top_n", None)
-# #         lr = cond_data.get("layer_range", None)
-# #         print(f'    Neurons ablated: {n_abl} ({pct}%)  '
-# #               f'method={method}  top_n={top_n}  layers={lr}')
-# #         if 'pope' in cond_data:
-# #             pope = cond_data['pope']
-# #             print(f'    POPE accuracy: {pope["accuracy"]:.4f}  F1: {pope["f1"]:.4f}')
-# #         if 'chair' in cond_data:
-# #             chair = cond_data['chair']
-# #             print(f'    CHAIR_i: {chair["chair_i"]:.4f}  CHAIR_s: {chair["chair_s"]:.4f}')
-# #         if 'deltas_vs_baseline' in cond_data:
-# #             d = cond_data['deltas_vs_baseline']
-# #             parts = []
-# #             for k, v in d.items():
-# #                 parts.append(f'{k}={v:+.4f}')
-# #             if parts:
-# #                 print(f'    Δ vs baseline: {", ".join(parts)}')
-
-# #     print(f'\nSaved → {summary_path}')
-
-
-# # # ═══════════════════════════════════════════════════════════════════
-# # # Section 9 — Main
-# # # ═══════════════════════════════════════════════════════════════════
-
-# # def main():
-# #     args = parse_args()
-
-# #     if args.merge:
-# #         merge_results(args)
-# #         return
-
-# #     device = f'cuda:{args.device}' if args.device.isdigit() else args.device
-# #     os.makedirs(args.output_dir, exist_ok=True)
-
-# #     # ── Parse layer range ──
-# #     layer_range = None
-# #     if args.layer_range:
-# #         parts = args.layer_range.split('-')
-# #         layer_range = (int(parts[0]), int(parts[1]))
-# #         print(f'Layer range filter: layers {layer_range[0]}–{layer_range[1]}')
-
-# #     # ── Load neuron labels (with raw data for confidence ranking) ──
-# #     print(f'Loading neuron labels from {args.labels_dir} ...')
-# #     print(f'  Label source: {args.label_source}')
-# #     labels_by_layer, raw_by_layer = load_neuron_labels(
-# #         args.labels_dir, args.model_type,
-# #         label_source=args.label_source)
-# #     if not labels_by_layer:
-# #         print(f'ERROR: No neuron labels found in {args.labels_dir}')
-# #         sys.exit(1)
-
-# #     n_layers_found = len(labels_by_layer)
-# #     n_neurons_per_layer = len(next(iter(labels_by_layer.values())))
-# #     print(f'  Loaded labels for {n_layers_found} layers, '
-# #           f'{n_neurons_per_layer} neurons/layer')
-
-# #     neuron_indices_by_type = get_neuron_indices_by_type(labels_by_layer)
-# #     for label_type, layer_dict in neuron_indices_by_type.items():
-# #         total = sum(len(v) for v in layer_dict.values())
-# #         print(f'  {label_type:12s}: {total:6d} neurons across {len(layer_dict)} layers')
-
-# #     # ── Build confidence rankings (for top_n / curve) ──
-# #     ranked_neurons = get_ranked_neurons_by_type(
-# #         raw_by_layer, args.label_source)
-# #     for label_type, ranking in ranked_neurons.items():
-# #         if ranking:
-# #             top_score = ranking[0][2]
-# #             bot_score = ranking[-1][2]
-# #             print(f'  {label_type:12s} confidence: '
-# #                   f'top={top_score:.4f}  bottom={bot_score:.4f}')
-
-# #     # ── Load model ──
-# #     print(f'\nLoading model ({args.model_type}) ...')
-# #     if args.model_type == 'hf':
-# #         model, processor, image_processor, image_token_id = load_model_hf(
-# #             args.hf_id, device)
-# #         tokenizer_or_processor = processor
-# #     else:
-# #         model, tokenizer, image_processor, image_token_id = load_model_original(
-# #             args.original_model_path, device)
-# #         tokenizer_or_processor = tokenizer
-# #     print('  Model loaded.')
-
-# #     # ── Compute CETT rankings (if requested) ──
-# #     cett_scores = None
-# #     if args.ranking_method == 'cett':
-# #         cett_img_dir = args.pope_img_dir or args.chair_img_dir
-# #         if cett_img_dir:
-# #             cett_ranked, cett_scores = compute_cett_rankings(
-# #                 model, args.model_type, tokenizer_or_processor,
-# #                 image_processor, image_token_id,
-# #                 cett_img_dir, labels_by_layer, device,
-# #                 n_images=args.n_cett_images, seed=args.seed)
-
-# #             # Override the label-based rankings with CETT-based rankings
-# #             ranked_neurons = cett_ranked
-# #             print(f'  Using CETT rankings (overriding label confidence)')
-
-# #             # Save CETT scores for analysis
-# #             cett_path = os.path.join(args.output_dir, 'cett_scores.json')
-# #             cett_serializable = {
-# #                 str(l): {str(n): float(v) for n, v in enumerate(scores)}
-# #                 for l, scores in cett_scores.items()
-# #             }
-# #             with open(cett_path, 'w') as f:
-# #                 json.dump(cett_serializable, f, indent=2)
-# #             print(f'  Saved CETT scores → {cett_path}')
-# #         else:
-# #             print('  WARNING: No image dir for CETT computation. '
-# #                   'Falling back to label-based ranking.')
-# #             args.ranking_method = 'label'
-
-# #     # ── Collect neuron stats (needed for mean/noise/clamp methods) ──
-# #     neuron_stats = None
-# #     if args.ablation_method != 'zero':
-# #         stats_img_dir = args.pope_img_dir or args.chair_img_dir
-# #         if stats_img_dir:
-# #             neuron_stats = collect_neuron_stats(
-# #                 model, args.model_type, tokenizer_or_processor,
-# #                 image_processor, image_token_id,
-# #                 stats_img_dir, device,
-# #                 n_images=args.n_stats_images, seed=args.seed)
-# #         else:
-# #             print('  WARNING: No image dir available for stats collection. '
-# #                   'Falling back to zero ablation for mean/noise/clamp.')
-# #             args.ablation_method = 'zero'
-
-# #     # ── Load POPE questions ──
-# #     pope_questions = None
-# #     if args.pope_path and os.path.isfile(args.pope_path):
-# #         print(f'\nLoading POPE questions from {args.pope_path} ...')
-# #         pope_questions = load_pope_questions(args.pope_path, args.pope_num_questions)
-# #         print(f'  Loaded {len(pope_questions)} questions')
-
-# #     # ── Build list of (condition, top_n) runs ──
-# #     # In curve mode, we sweep top_n for each condition
-# #     if args.curve:
-# #         curve_steps = [int(x) for x in args.curve_steps.split(',')]
-# #         # Add 'all' (None) as the final step
-# #         top_n_values = curve_steps + [None]
-# #         print(f'\n  Curve mode: sweeping top_n = '
-# #               f'{[str(x) for x in curve_steps]} + [all]')
-# #     elif args.top_n is not None:
-# #         top_n_values = [args.top_n]
-# #     else:
-# #         top_n_values = [None]  # None = ablate all neurons of the type
-
-# #     # ── Run each (condition × top_n) combination ──
-# #     for condition in args.conditions:
-# #         for top_n in top_n_values:
-# #             # Build a descriptive run name
-# #             run_name = condition
-# #             if top_n is not None:
-# #                 run_name = f'{condition}_top{top_n}'
-# #             if layer_range:
-# #                 run_name = f'{run_name}_L{layer_range[0]}-{layer_range[1]}'
-# #             if args.ablation_method != 'zero':
-# #                 run_name = f'{run_name}_{args.ablation_method}'
-
-# #             print(f'\n{"="*60}')
-# #             print(f'CONDITION: {run_name}')
-# #             print(f'{"="*60}')
-
-# #             # Check if already done
-# #             marker_path = os.path.join(args.output_dir,
-# #                                        f'ablation_condition_{run_name}.json')
-# #             if os.path.isfile(marker_path):
-# #                 print(f'  [skip] Already complete — {marker_path}')
-# #                 continue
-
-# #             # Build ablation indices
-# #             ablate_indices = build_ablation_indices(
-# #                 condition, neuron_indices_by_type, labels_by_layer,
-# #                 args.seed, top_n=top_n, layer_range=layer_range,
-# #                 ranked_neurons=ranked_neurons)
-# #             n_ablated = sum(len(v) for v in ablate_indices.values())
-# #             n_layers_ablated = len(ablate_indices)
-# #             pct = 100 * n_ablated / (n_layers_found * n_neurons_per_layer)
-# #             print(f'  Ablating {n_ablated} neurons ({pct:.1f}%) '
-# #                   f'across {n_layers_ablated} layers '
-# #                   f'[method={args.ablation_method}]')
-
-# #             # Register hooks
-# #             handles = make_ablation_hooks(
-# #                 model, args.model_type, ablate_indices,
-# #                 method=args.ablation_method,
-# #                 neuron_stats=neuron_stats, seed=args.seed)
-# #             print(f'  Registered {len(handles)} ablation hooks')
-
-# #             result = {
-# #                 'condition': run_name,
-# #                 'base_condition': condition,
-# #                 'ablation_method': args.ablation_method,
-# #                 'ranking_method': args.ranking_method,
-# #                 'top_n': top_n,
-# #                 'layer_range': list(layer_range) if layer_range else None,
-# #                 'n_neurons_ablated': n_ablated,
-# #                 'n_layers_ablated': n_layers_ablated,
-# #                 'pct_neurons_ablated': round(pct, 2),
-# #             }
-
-# #             t0 = time.time()
-
-# #             # POPE evaluation
-# #             if pope_questions and args.pope_img_dir:
-# #                 print(f'\n  Running POPE evaluation ({len(pope_questions)} questions) ...')
-# #                 pope_result = evaluate_pope(
-# #                     model, args.model_type, tokenizer_or_processor,
-# #                     image_processor, image_token_id,
-# #                     pope_questions, args.pope_img_dir, device)
-# #                 result['pope'] = pope_result
-# #                 print(f'  POPE: accuracy={pope_result["accuracy"]:.4f}  '
-# #                       f'F1={pope_result["f1"]:.4f}  '
-# #                       f'yes_ratio={pope_result["yes_ratio"]:.4f}')
-
-# #             # CHAIR evaluation
-# #             if args.chair_ann_path and args.chair_img_dir:
-# #                 print(f'\n  Running CHAIR evaluation ({args.chair_num_images} images) ...')
-# #                 chair_result = evaluate_chair(
-# #                     model, args.model_type, tokenizer_or_processor,
-# #                     image_processor, image_token_id,
-# #                     args.chair_ann_path, args.chair_img_dir, device,
-# #                     num_images=args.chair_num_images, seed=args.seed)
-# #                 result['chair'] = chair_result
-# #                 print(f'  CHAIR_i={chair_result["chair_i"]:.4f}  '
-# #                       f'CHAIR_s={chair_result["chair_s"]:.4f}')
-
-# #             elapsed = time.time() - t0
-# #             result['time_sec'] = round(elapsed, 1)
-
-# #             # Remove hooks
-# #             for h in handles:
-# #                 h.remove()
-
-# #             # Save per-condition result
-# #             with open(marker_path, 'w') as f:
-# #                 json.dump(result, f, indent=2)
-# #             print(f'\n  Saved → {marker_path} ({elapsed:.1f}s)')
-
-# #     # ── Auto-merge if all conditions ran in this process ──
-# #     print(f'\n{"="*60}')
-# #     print('Merging all condition results ...')
-# #     merge_results(args)
-
-
-# # if __name__ == '__main__':
-# #     main()

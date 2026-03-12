@@ -11,3 +11,9 @@ modality_taxonomy/modern_vlms/pretrained/
 modality_taxonomy/data/
 modality_taxonomy/results/
 modality_taxonomy/logs/
+modality_taxonomy/modern_vlms/intervl_env/
+modality_taxonomy/.cache/
+modality_taxonomy/results_copy/
+modality_taxonomy/results copy/
+*.npz
+*.json.orig
