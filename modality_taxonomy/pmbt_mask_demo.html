@@ -1,0 +1,433 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PMBT · one mask, three uses</title>
+
+<!--
+  PMBT mask demo — classify once, then diagnose / steer / merge.
+  Single persistent neuron field = MLP intermediate dim of ONE LLM-backbone
+  layer inside a VLM. PMBT colours are fixed; only the operation changes.
+  Self-contained: no build step, no external assets. Open in any browser.
+-->
+
+<style>
+  :root{
+    --bg:#0E1117;          /* ink-slate page                              */
+    --panel:#141A23;       /* raised surfaces                             */
+    --line:#222B36;        /* hairlines                                   */
+    --ink:#E6EDF3;         /* primary text                                */
+    --mut:#8A97A6;         /* muted text                                  */
+    --visual:#F5A623;      /* amber  = vision / light                     */
+    --text:#2DD4BF;        /* teal   = language                           */
+    --multi:#C084FC;       /* violet = the binding (cross-modal)          */
+    --unknown:#475569;     /* slate  = unresolved                         */
+    --mono:'IBM Plex Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+    --sans:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans)}
+  body{display:flex;justify-content:center;padding:28px 18px 40px}
+  .wrap{width:100%;max-width:1080px}
+
+  /* ---- header --------------------------------------------------------- */
+  header{display:flex;flex-wrap:wrap;align-items:baseline;gap:14px;
+         padding-bottom:16px;border-bottom:1px solid var(--line)}
+  .brand{font-family:var(--mono);font-size:13px;letter-spacing:.14em;
+         text-transform:uppercase;color:var(--mut)}
+  h1{font-family:var(--mono);font-weight:600;font-size:24px;margin:0;
+     letter-spacing:-.01em}
+  h1 .em{color:var(--text)}
+  .legend{margin-left:auto;display:flex;gap:14px;flex-wrap:wrap}
+  .chip{display:flex;align-items:center;gap:6px;font-family:var(--mono);
+        font-size:11px;color:var(--mut)}
+  .dot{width:10px;height:10px;border-radius:2px}
+
+  /* ---- architecture strip -------------------------------------------- */
+  .arch{display:flex;align-items:stretch;gap:0;margin:18px 0;
+        border:1px solid var(--line);border-radius:10px;overflow:hidden;
+        font-family:var(--mono);font-size:11px}
+  .stage-box{flex:1;padding:11px 12px;color:var(--mut);
+             border-right:1px solid var(--line);position:relative;
+             text-align:center;transition:color .3s}
+  .stage-box:last-child{border-right:0}
+  .stage-box small{display:block;font-size:9px;letter-spacing:.08em;
+                   opacity:.65;margin-top:3px}
+  .stage-box.llm{flex:1.9;color:var(--ink);background:#10161F}
+  .stage-box.llm.live{box-shadow:inset 0 -2px 0 var(--text)}
+
+  /* ---- main grid ------------------------------------------------------ */
+  .main{display:grid;grid-template-columns:1.15fr .85fr;gap:20px;
+        align-items:stretch}
+  @media (max-width:760px){.main{grid-template-columns:1fr}}
+
+  /* neuron field (the signature element) */
+  .field-wrap{background:var(--panel);border:1px solid var(--line);
+              border-radius:12px;padding:16px}
+  .field-label{font-family:var(--mono);font-size:11px;color:var(--mut);
+               margin-bottom:12px;line-height:1.5}
+  .field-label b{color:var(--ink);font-weight:600}
+  .field-stack{display:flex;gap:8px}
+  .depth-axis{display:flex;flex-direction:column;justify-content:space-between;
+              font-family:var(--mono);font-size:9px;color:var(--mut);padding:1px 0}
+  .field{flex:1;display:grid;gap:3px}
+  .neuron{aspect-ratio:1;border-radius:2px;background:var(--unknown);
+          transition:background .45s ease, transform .25s ease,
+                     box-shadow .25s ease, opacity .35s ease;position:relative}
+  .neuron.visual{background:var(--visual)}
+  .neuron.text  {background:var(--text)}
+  .neuron.multi {background:var(--multi)}
+  .neuron.unknown{background:var(--unknown)}
+  /* enrichment: ring on hallucination-driving neurons */
+  .neuron.hd::after{content:"";position:absolute;inset:-2px;border-radius:3px;
+            box-shadow:0 0 0 1.5px var(--ink);opacity:0;transition:opacity .4s}
+  .field.show-hd .neuron.hd::after{opacity:.9}
+  /* steering: pulse the visual neurons */
+  .field.steer .neuron.visual{animation:pulse 1.4s ease-in-out infinite}
+  @keyframes pulse{0%,100%{transform:scale(1);box-shadow:0 0 0 0 rgba(245,166,35,0)}
+                   50%{transform:scale(1.18);box-shadow:0 0 8px 2px rgba(245,166,35,.55)}}
+  /* merging: text neurons take the injection, others freeze/dim */
+  .field.merge .neuron:not(.text){opacity:.32}
+  .field.merge .neuron.text{animation:inject 1.6s ease-in-out infinite}
+  @keyframes inject{0%,100%{box-shadow:0 0 0 0 rgba(45,212,191,0)}
+                    50%{box-shadow:0 0 9px 2px rgba(45,212,191,.6)}}
+
+  /* operation panel */
+  .panel{background:var(--panel);border:1px solid var(--line);
+         border-radius:12px;padding:20px 20px 18px;display:flex;
+         flex-direction:column;min-height:340px}
+  .step-no{font-family:var(--mono);font-size:12px;letter-spacing:.18em;
+           color:var(--text)}
+  .panel h2{font-family:var(--mono);font-weight:600;font-size:19px;
+            margin:6px 0 4px}
+  .panel .sub{color:var(--mut);font-size:13px;line-height:1.55;margin:0 0 16px}
+  .panel .sub code{font-family:var(--mono);font-size:12px;color:var(--ink);
+                   background:#0c1119;padding:1px 5px;border-radius:4px}
+
+  /* metric readouts */
+  .metrics{display:flex;gap:22px;flex-wrap:wrap;margin:2px 0 14px}
+  .metric{min-width:78px}
+  .metric .v{font-family:var(--mono);font-size:26px;font-weight:600;
+             line-height:1}
+  .metric .v.good{color:var(--text)}
+  .metric .v.amber{color:var(--visual)}
+  .metric .k{font-family:var(--mono);font-size:10px;color:var(--mut);
+             letter-spacing:.08em;margin-top:5px;text-transform:uppercase}
+
+  /* mask-application note */
+  .mask-note{font-family:var(--mono);font-size:11px;color:var(--mut);
+             line-height:1.7;border-top:1px dashed var(--line);
+             padding-top:12px;margin-top:auto}
+  .mask-note .on{color:var(--ink)}
+  .mask-note .off{color:var(--unknown)}
+
+  .caption{margin-top:14px;font-size:12.5px;line-height:1.6;color:var(--mut)}
+  .caption b{color:var(--ink)}
+  .caption .ill{color:var(--visual);font-style:italic}
+
+  /* ---- controls ------------------------------------------------------- */
+  .controls{display:flex;align-items:center;gap:16px;margin-top:20px;
+            padding-top:16px;border-top:1px solid var(--line)}
+  button{font-family:var(--mono);font-size:12px;color:var(--ink);
+         background:var(--panel);border:1px solid var(--line);
+         border-radius:7px;padding:8px 14px;cursor:pointer;
+         transition:border-color .2s,background .2s}
+  button:hover{border-color:var(--text)}
+  button:focus-visible{outline:2px solid var(--text);outline-offset:2px}
+  .dots{display:flex;gap:8px;margin:0 auto}
+  .pdot{width:9px;height:9px;border-radius:50%;background:var(--line);
+        border:0;padding:0;cursor:pointer;transition:background .25s,transform .25s}
+  .pdot.on{background:var(--text);transform:scale(1.25)}
+  .progress{font-family:var(--mono);font-size:11px;color:var(--mut)}
+
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important;transition-duration:.001ms!important}
+  }
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="brand">PMBT</span>
+    <h1>one mask, <span class="em">three uses</span></h1>
+    <div class="legend">
+      <span class="chip"><span class="dot" style="background:var(--visual)"></span>visual</span>
+      <span class="chip"><span class="dot" style="background:var(--text)"></span>text</span>
+      <span class="chip"><span class="dot" style="background:var(--multi)"></span>multimodal</span>
+      <span class="chip"><span class="dot" style="background:var(--unknown)"></span>unknown</span>
+    </div>
+  </header>
+
+  <!-- VLM data path: the mask lives inside ONE LLM-backbone layer -->
+  <div class="arch" id="arch">
+    <div class="stage-box">image<small>pixels</small></div>
+    <div class="stage-box">vision encoder<small>ViT / SigLIP</small></div>
+    <div class="stage-box">projector<small>→ visual tokens</small></div>
+    <div class="stage-box llm" id="archLLM">LLM backbone · 28 layers<small>← PMBT mask applied across the stack</small></div>
+    <div class="stage-box">logits<small>next token</small></div>
+  </div>
+
+  <div class="main">
+    <div class="field-wrap">
+      <div class="field-label">
+        <b>neuron field</b> — entire LLM backbone: 28 layers &times; representative
+        neuron slice (rows = layers, depth top&rarr;bottom). Colour = PMBT label,
+        fixed across all stages.
+      </div>
+      <div class="field-stack">
+        <div class="depth-axis"><span>L0</span><span>L13</span><span>L27</span></div>
+        <div class="field" id="field"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <span class="step-no" id="stepNo">01 / 04</span>
+      <h2 id="title">Classify</h2>
+      <p class="sub" id="sub"></p>
+      <div class="metrics" id="metrics"></div>
+      <div class="caption" id="caption"></div>
+      <div class="mask-note" id="maskNote"></div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button id="prev" aria-label="Previous stage">◀ prev</button>
+    <div class="dots" id="dots"></div>
+    <button id="play" aria-label="Play or pause">❚❚ pause</button>
+    <button id="next" aria-label="Next stage">next ▶</button>
+    <span class="progress" id="prog"></span>
+  </div>
+</div>
+
+<script>
+/* ============================================================================
+   1. CONFIG — palette proportions for the representative neuron slice.
+      These roughly track the paper: a smaller multimodal class after PMBT,
+      with substantial visual & text specialists and an unresolved remainder.
+   ========================================================================== */
+const LAYERS = 28, PER = 40;                // entire LLM backbone: 28 layers, 40-neuron slice each
+const COLS = PER, ROWS = LAYERS, N = LAYERS * PER;
+
+/* deterministic PRNG so the field is identical on every reload (repo-stable) */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const rng = mulberry32(7);
+
+/* assign each neuron a fixed PMBT label and a fixed "hallucination-driving"
+   flag. The modality mix varies with depth d in [0,1]: visual neurons thin out
+   deeper but never vanish (the key finding), text grows with depth, and the
+   multimodal class peaks mid-stack. Visual neurons are also over-represented
+   among HD neurons — that asymmetry is what the enrichment stage measures. */
+const labels = [];
+for(let L=0; L<LAYERS; L++){
+  const d  = L/(LAYERS-1);                   // normalised depth
+  const pv = 0.22 - 0.10*d;                  // visual: more early, persists deep
+  const pt = 0.22 + 0.12*d;                  // text: grows with depth
+  const pm = 0.26*Math.exp(-Math.pow(d-0.5,2)/0.08); // multimodal: mid-stack bump
+  for(let j=0; j<PER; j++){
+    const r = rng();
+    let lab = 'unknown';
+    if(r < pv) lab='visual';
+    else if(r < pv+pt) lab='text';
+    else if(r < pv+pt+pm) lab='multi';
+    labels.push(lab);
+  }
+}
+const hd = labels.map(lab=>{
+  const p = lab==='visual' ? 0.42 : lab==='text' ? 0.10
+          : lab==='multi'  ? 0.16 : 0.08;          // HD probability by label
+  return rng() < p;
+});
+
+/* ============================================================================
+   2. BUILD the neuron field once. Cells start as 'unknown' (pre-classify).
+   ========================================================================== */
+const field = document.getElementById('field');
+field.style.gridTemplateColumns = `repeat(${COLS},1fr)`;
+const cells = [];
+for(let i=0;i<N;i++){
+  const d = document.createElement('div');
+  d.className = 'neuron unknown';
+  if(hd[i]) d.classList.add('hd');            // ring marker, hidden until enrichment
+  field.appendChild(d);
+  cells.push(d);
+}
+
+/* ============================================================================
+   3. ANIMATION HELPERS
+   ========================================================================== */
+let timers = [];
+function clearTimers(){ timers.forEach(clearTimeout); timers = []; }
+
+/* paint every neuron its true PMBT label, optionally staggered (classify) */
+function paintLabels(stagger){
+  cells.forEach((c,i)=>{
+    const apply = ()=>{ c.className = 'neuron ' + labels[i] + (hd[i]?' hd':''); };
+    if(stagger){ const row=Math.floor(i/COLS), col=i%COLS;
+                 timers.push(setTimeout(apply, row*60 + col*8)); } // sweep down the stack
+    else apply();
+  });
+}
+
+/* count a metric element from -> to over a duration, formatted to 1 decimal */
+function countTo(el, from, to, ms){
+  const t0 = performance.now();
+  function frame(now){
+    const k = Math.min(1, (now - t0)/ms);
+    const e = 1 - Math.pow(1-k, 3);            // easeOutCubic
+    el.textContent = (from + (to-from)*e).toFixed(1);
+    if(k < 1) requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+const fieldEl = document.getElementById('field');
+function resetFieldFx(){ fieldEl.classList.remove('show-hd','steer','merge'); }
+
+/* ============================================================================
+   4. STAGE DEFINITIONS — each owns the whole panel + the field's behaviour.
+   ========================================================================== */
+const P = id => document.getElementById(id);
+
+const stages = [
+  { /* 0 — CLASSIFY ------------------------------------------------------- */
+    title:'Classify', archLive:true,
+    enter(){
+      cells.forEach(c=>c.className='neuron unknown');   // back to pre-test state
+      resetFieldFx();
+      paintLabels(true);                                // permutation test resolves
+      P('sub').innerHTML = 'Permutation-Based Modality Test: an Otsu per-neuron '
+        + 'threshold + <code>1000</code> label permutations give a calibrated '
+        + '<code>p</code>-value per neuron at <code>&alpha;=0.05</code>. No hand-tuned thresholds.';
+      P('metrics').innerHTML = ''
+        + metric('1000','permutations')
+        + metric('0.05','&alpha; level','good')
+        + metric('4','VLM backbones');
+      P('caption').innerHTML = '<b>01 · Classify once.</b> Each MLP neuron is '
+        + 'labelled <b>visual</b>, <b>text</b>, <b>multimodal</b>, or <b>unknown</b>. '
+        + 'This single labelling is reused by all three downstream operations.';
+      P('maskNote').innerHTML = 'labels computed on <span class="on">gate_proj · up_proj</span> '
+        + 'rows (MLP intermediate dim); attention labels computed per-head on '
+        + '<span class="on">q_proj · o_proj</span>.';
+    }
+  },
+  { /* 1 — ENRICHMENT ----------------------------------------------------- */
+    title:'Enrichment', archLive:false,
+    enter(){
+      paintLabels(false); resetFieldFx();
+      fieldEl.classList.add('show-hd');                 // reveal HD rings
+      P('sub').innerHTML = 'Cross-reference the mask with hallucination-driving '
+        + '(HD) neurons. Test each modality group for over-representation via an '
+        + 'odds ratio on the 2&times;2 contingency table.';
+      P('metrics').innerHTML = ''
+        + '<div class="metric"><div class="v amber" id="orVis">1.0</div><div class="k">OR · visual</div></div>'
+        + '<div class="metric"><div class="v good"  id="orTxt">1.0</div><div class="k">OR · text</div></div>';
+      countTo(P('orVis'), 1.0, 2.4, 900);               // visual enriched (>1)
+      countTo(P('orTxt'), 1.0, 0.8, 900);               // text not enriched
+      P('caption').innerHTML = '<b>02 · Enrichment.</b> Among HD neurons (ringed), '
+        + '<b>visual</b> neurons are statistically over-represented while <b>text</b> '
+        + 'neurons are not — the mask turns a vague hypothesis into a measurable '
+        + 'odds ratio. <span class="ill">(illustrative OR values)</span>';
+      P('maskNote').innerHTML = 'diagnostic only — no weights touched. '
+        + 'group membership read straight from the PMBT labels.';
+    }
+  },
+  { /* 2 — STEERING ------------------------------------------------------- */
+    title:'Activation steering', archLive:true,
+    enter(){
+      paintLabels(false); resetFieldFx();
+      fieldEl.classList.add('steer');                   // pulse visual neurons
+      P('sub').innerHTML = 'At inference, scale <code>visual</code>-neuron '
+        + 'activations by <code>&alpha;=0.5</code>. No retraining, no weight edits — '
+        + 'a free, reversible hook keyed entirely off the mask.';
+      P('metrics').innerHTML = ''
+        + '<div class="metric"><div class="v good" id="pope">90.2</div><div class="k">POPE &uarr;</div></div>'
+        + '<div class="metric"><div class="v good" id="chair">26.1</div><div class="k">CHAIRi &darr;</div></div>';
+      countTo(P('pope'), 90.2, 92.0, 900);              // real LLaVA-OV numbers
+      countTo(P('chair'), 26.1, 24.3, 900);
+      P('caption').innerHTML = '<b>03 · Steering.</b> On LLaVA-OneVision this lifts '
+        + 'POPE 90.2&rarr;92.0 and lowers CHAIRi 26.1&rarr;24.3 at <code>&alpha;=0.5</code> — '
+        + 'the same mask, now used as a runtime forward-hook.';
+      P('maskNote').innerHTML = 'forward hook multiplies activations of '
+        + '<span class="on">visual</span> rows only; '
+        + '<span class="off">text · multimodal · unknown</span> pass through unchanged.';
+    }
+  },
+  { /* 3 — MERGING -------------------------------------------------------- */
+    title:'Weight merging', archLive:true,
+    enter(){
+      paintLabels(false); resetFieldFx();
+      fieldEl.classList.add('merge');                   // inject into text, freeze rest
+      P('sub').innerHTML = 'Compute a math task vector <code>&tau; = &theta;_math &minus; &theta;_base</code> '
+        + 'and add <code>&lambda;&middot;&tau;</code> on the <code>text</code> mask only; '
+        + 'visual / multimodal rows stay frozen.';
+      P('metrics').innerHTML = ''
+        + metric('+&Delta;','math reasoning','good')
+        + '<div class="metric"><div class="v amber" id="hold">90.2</div><div class="k">POPE held</div></div>';
+      P('caption').innerHTML = '<b>04 · Merging.</b> Reasoning improves while visual '
+        + 'grounding is shielded — the same mask, now applied in <b>weight space</b> '
+        + 'instead of activation space. <span class="ill">(figures illustrative)</span>';
+      P('maskNote').innerHTML = 'injection on <span class="on">text</span> rows of '
+        + 'gate_proj · up_proj · down_proj; '
+        + '<span class="off">visual · multimodal frozen</span>; '
+        + '<span class="off">k_proj · v_proj · norms uniform</span>.';
+    }
+  }
+];
+
+function metric(v,k,cls){
+  return `<div class="metric"><div class="v ${cls||''}">${v}</div><div class="k">${k}</div></div>`;
+}
+
+/* ============================================================================
+   5. PLAYBACK CONTROLLER — manual prev/next + dots, plus autoplay.
+   ========================================================================== */
+let idx = 0, playing = true, auto = null;
+const DWELL = 4200;                                     // ms per stage when playing
+
+const dotsBox = document.getElementById('dots');
+stages.forEach((_,i)=>{
+  const b = document.createElement('button');
+  b.className = 'pdot'; b.setAttribute('aria-label','Go to stage '+(i+1));
+  b.onclick = ()=>{ goto(i); restartAuto(); };
+  dotsBox.appendChild(b);
+});
+const pdots = [...dotsBox.children];
+
+function render(){
+  clearTimers();
+  const s = stages[idx];
+  P('stepNo').textContent = String(idx+1).padStart(2,'0') + ' / 0' + stages.length;
+  P('title').textContent  = s.title;
+  P('prog').textContent   = `${idx+1} of ${stages.length}`;
+  document.getElementById('archLLM').classList.toggle('live', !!s.archLive);
+  pdots.forEach((d,i)=>d.classList.toggle('on', i===idx));
+  s.enter();
+}
+function goto(i){ idx = (i + stages.length) % stages.length; render(); }
+function next(){ goto(idx+1); }
+function prev(){ goto(idx-1); }
+
+function startAuto(){ stopAuto(); auto = setInterval(()=>goto(idx+1), DWELL); }
+function stopAuto(){ if(auto){ clearInterval(auto); auto=null; } }
+function restartAuto(){ if(playing) startAuto(); }
+
+document.getElementById('next').onclick = ()=>{ next(); restartAuto(); };
+document.getElementById('prev').onclick = ()=>{ prev(); restartAuto(); };
+document.getElementById('play').onclick = (e)=>{
+  playing = !playing;
+  e.target.textContent = playing ? '❚❚ pause' : '▶ play';
+  playing ? startAuto() : stopAuto();
+};
+/* keyboard: arrows step, space toggles */
+document.addEventListener('keydown', e=>{
+  if(e.key==='ArrowRight'){ next(); restartAuto(); }
+  else if(e.key==='ArrowLeft'){ prev(); restartAuto(); }
+  else if(e.code==='Space'){ e.preventDefault(); document.getElementById('play').click(); }
+});
+
+/* honour reduced-motion: start paused on the first stage */
+if(window.matchMedia('(prefers-reduced-motion:reduce)').matches){
+  playing = false; document.getElementById('play').textContent = '▶ play';
+  render();
+} else {
+  render(); startAuto();
+}
+</script>

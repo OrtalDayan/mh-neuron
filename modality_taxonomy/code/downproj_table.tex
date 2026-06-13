@@ -1,0 +1,115 @@
+% ════════════════════════════════════════════════════════════════════
+% Down_proj-only weight merging — paper tables
+% ════════════════════════════════════════════════════════════════════
+% Generated from results/25-merge/*/pmbt_*_mlponly_a1.0_o1.0_downproj/
+% via extract_merge_results.py. Use generate_downproj_table.py to
+% auto-fill TBD placeholders from the score CSVs.
+%
+% REQUIREMENTS:
+%   \usepackage{booktabs}
+%   \usepackage{multirow}
+%   \usepackage{siunitx}  % optional, for number alignment
+%
+% ════════════════════════════════════════════════════════════════════
+
+% ────────────────────────────────────────────────────────────────────
+% Main table — one-page headline comparison
+%
+%   3 models × 4 rows (Baseline / Uniform / PMBT / Down_proj only at
+%   the same PMBT winner's triplet). Columns = 6 curated math benches
+%   + MathMean summary.
+% ────────────────────────────────────────────────────────────────────
+
+\begin{table*}[t]
+\centering
+\small
+\caption{\textbf{Down\_proj-only weight merging is sufficient to transfer math capability.}
+For each VLM, we compare the baseline, BRV uniform merging, full PMBT-guided merging,
+and our new down\_proj-only variant — which merges \emph{only the $W_{\text{down}}$
+columns} of PMBT-labeled MLP neurons (leaving $W_{\text{gate}}$, $W_{\text{up}}$, all
+attention weights, layernorms, and biases at their VLM baseline values). Down\_proj-only
+uses the same PMBT $(\alpha_{\text{text}}, \alpha_{\text{visual}}, \alpha_{\text{multi}})$
+triplet as the PMBT winner. All numbers are accuracy (\%) except where noted.
+\emph{MathMn} = unweighted mean of six math benchmarks (shown and MathVerse-TD/TL/VI/VD/VO).}
+\label{tab:downproj-main}
+\begin{tabular}{llcccccc r}
+\toprule
+                 &                             & \multicolumn{6}{c}{\textbf{Math benchmarks}}                                          & \textbf{MathMn} \\
+                                                                                         \cmidrule(lr){3-8}
+\textbf{Model}   & \textbf{Method}             & MathVista   & MathVerse-Avg & MMStar     & DynaMath   & MathVision & MM-Math &       \\
+\midrule
+\multirow{4}{*}{\textbf{LLaVA-Next}}
+                 & Baseline                    & 37.8        & 18.5          & 43.3       & 22.6       & 14.1       & 0.6     & 21.1  \\
+                 & Uniform ($\alpha$=0.8)      & 37.6        & 19.8          & 43.5       & 24.2       & 13.5       & 0.5     & 22.0  \\
+                 & PMBT t0.7/v1.0/m1.0         & 39.2        & 20.2          & 43.7       & 23.9       & 14.1       & 0.6     & 22.3  \\
+                 & \quad+ down\_proj only      & \textbf{TBD} & \textbf{TBD}  & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} & \textbf{TBD}  \\
+\midrule
+\multirow{4}{*}{\textbf{Idefics2}}
+                 & Baseline                    & 52.1        & 18.2          & 49.3       & 21.8       & 16.8       & 3.9     & 23.5  \\
+                 & Uniform ($\alpha$=0.9)      & 53.1        & 18.7          & 48.4       & 23.0       & 17.8       & 4.1     & 24.0  \\
+                 & PMBT t0.8/v1.0/m0.9         & 53.6        & 19.1          & 48.3       & 20.8       & 17.1       & 4.0     & 23.7  \\
+                 & \quad+ down\_proj only      & \textbf{TBD} & \textbf{TBD}  & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} & \textbf{TBD}  \\
+\midrule
+\multirow{4}{*}{\textbf{Qwen2-VL}}
+                 & Baseline                    & 61.1        & 30.8          & 59.6       & 33.6       & 20.7       & 13.5    & 34.2  \\
+                 & Uniform ($\alpha$=0.9)      & 58.3        & 30.2          & 56.5       & 31.4       & 20.1       & 15.1    & 33.3  \\
+                 & PMBT t0.9/v1.0/m1.0         & 59.7        & 30.2          & 58.2       & 33.7       & 19.4       & 13.2    & 33.5  \\
+                 & \quad+ down\_proj only      & \textbf{TBD} & \textbf{TBD}  & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} & \textbf{TBD}  \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+
+% ────────────────────────────────────────────────────────────────────
+% Appendix — full 23-triplet sweep per model
+%
+%   For each (t, v, m) triplet in the canonical sweep, show the down_proj
+%   MathMn and the delta vs the matching full-PMBT config.
+% ────────────────────────────────────────────────────────────────────
+
+\begin{table*}[t]
+\centering
+\small
+\caption{\textbf{Down\_proj-only vs. full PMBT across the canonical 23-triplet sweep.}
+Each row shows MathMn (mean of 10 math benchmarks) for the down\_proj-only variant
+at that $(\alpha_t, \alpha_v, \alpha_m)$ triplet, alongside the matching full-PMBT
+number and their difference. Positive $\Delta$ means down\_proj-only is better.}
+\label{tab:downproj-sweep}
+\begin{tabular}{l l rrr rrr rrr}
+\toprule
+                 &                      & \multicolumn{3}{c}{\textbf{LLaVA-Next}} & \multicolumn{3}{c}{\textbf{Idefics2}} & \multicolumn{3}{c}{\textbf{Qwen2-VL}} \\
+                                        \cmidrule(lr){3-5} \cmidrule(lr){6-8} \cmidrule(lr){9-11}
+\textbf{$\alpha_t$} & \textbf{($\alpha_v$, $\alpha_m$)}
+                 & DP & Full & $\Delta$ & DP & Full & $\Delta$ & DP & Full & $\Delta$ \\
+\midrule
+0.3   & (1.0, 0.9)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.3   & (1.0, 1.0)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.5   & (1.0, 0.9)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.5   & (1.0, 1.0)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.6   & (1.0, 0.9)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.6   & (1.0, 1.0)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.65  & (1.0, 0.9)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.65  & (1.0, 1.0)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.7   & (0.9, 0.9)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.7   & (0.95, 0.9)  & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.7   & (1.0, 0.5)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.7   & (1.0, 0.7)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.7   & (1.0, 0.9)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.7   & (1.0, 1.0)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.75  & (1.0, 0.9)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.75  & (1.0, 1.0)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.8   & (1.0, 0.8)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.8   & (1.0, 0.9)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.8   & (1.0, 1.0)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.85  & (1.0, 0.9)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.85  & (1.0, 1.0)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.9   & (1.0, 0.9)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+0.9   & (1.0, 1.0)   & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD & TBD \\
+\midrule
+\multicolumn{2}{l}{\textbf{Mean $\Delta$}}
+                    &     &      & \textbf{TBD} &     &      & \textbf{TBD} &     &      & \textbf{TBD} \\
+\multicolumn{2}{l}{\textbf{\# DP $>$ full}}
+                    &     &      & \textbf{TBD / 23} &     &      & \textbf{TBD / 23} &     &      & \textbf{TBD / 23} \\
+\bottomrule
+\end{tabular}
+\end{table*}

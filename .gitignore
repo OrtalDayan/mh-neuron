@@ -1,0 +1,69 @@
+# OS / editor junk
+.DS_Store
+__pycache__/
+*.pyc
+
+# model weights & large binaries
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.npz
+*.json.orig
+
+# venvs, data, generated outputs
+modality_taxonomy/.venv/
+modality_taxonomy/modern_vlms/.venv/
+modality_taxonomy/modern_vlms/intervl_env/
+modality_taxonomy/modern_vlms/pretrained/
+modality_taxonomy/.cache/
+modality_taxonomy/data/
+modality_taxonomy/results/
+modality_taxonomy/results_copy/
+modality_taxonomy/results copy/
+modality_taxonomy/logs/
+
+# Claude Code local state
+.claude/
+
+# scratch logs & debug output
+*.err
+*.log
+modality_taxonomy/dbg_*
+modality_taxonomy/check_q253*
+modality_taxonomy/flash_build*
+modality_taxonomy/test_l29.*
+
+# stray / accidental files
+modality_taxonomy/^C
+modality_taxonomy/0.5
+
+# old scratch scripts & backups
+*_old*.py
+*_old*.sh
+code_old/
+modality_taxonomy/code_old/
+backups/
+modality_taxonomy/backups/
+
+# external vendored dependency (install separately)
+LLaVA/
+
+# binary figures (add final versions deliberately if needed)
+*.png
+modality_taxonomy/*.pdf
+
+# working materials — papers, plans, personal docs, vendored repos (keep local, not public)
+modality_taxonomy/resources/
+modality_taxonomy/plans/
+# catch scratch the earlier patterns missed
+*.bak*
+*0ld*
+*old*.sh
+*old*.py
+old6
+modality_taxonomy/code/debug_*
+modality_taxonomy/code/neuron_weight_merge/
+# stray csv summaries at repo top of modality_taxonomy
+modality_taxonomy/*.csv
+modality_taxonomy/.gitignore
