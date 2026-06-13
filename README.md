@@ -16,11 +16,9 @@ activation steering, and taxonomy-guided weight merging.
 
 ## Demo
 
-An interactive animation of how the PMBT mask is applied across the LLM backbone of a VLM,
-walking through classification → enrichment → activation steering → weight merging:
+Interactive animation of how the PMBT mask is applied across the LLM backbone of a VLM — classification → enrichment → activation steering → weight merging.
 
-[`modality_taxonomy/pmbt_mask_demo.html`](modality_taxonomy/pmbt_mask_demo.html) —
-download the raw file and open it in a browser to view the animation.
+▶ **[Live demo](https://ortaldayan.github.io/mh-neuron/modality_taxonomy/pmbt_mask_demo.html)** · [view source](modality_taxonomy/pmbt_mask_demo.html)
 
 The animation's steering numbers (POPE / CHAIRi on LLaVA-OneVision) are real results; the
 enrichment odds ratios and merging deltas shown are **illustrative/schematic** and labelled
