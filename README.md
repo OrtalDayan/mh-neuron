@@ -16,7 +16,10 @@ activation steering, and taxonomy-guided weight merging.
 
 ## Demo
 
-https://github.com/user-attachments/assets/00a189e9-3eb8-4182-87ec-56b53f1610e1
+
+
+https://github.com/user-attachments/assets/dabca531-6a30-437f-8766-959f8615572f
+
 
 
 Interactive animation of how the PMBT mask is applied across the LLM backbone of a VLM — classification → enrichment → activation steering → weight merging.
