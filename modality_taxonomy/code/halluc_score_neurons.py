@@ -199,6 +199,12 @@ def parse_args():
                         'generate() — much faster, same yes/no decision. Applies to '
                         'HF-style backends (llava-hf, llava-ov, qwen2vl, idefics2, '
                         'llava-llama3); internvl keeps its generate path.')
+    p.add_argument('--dense_scoring', action='store_true',                 # Line 18c: family B dense metric
+                   help='DENSE (family B) scoring for BOTH legs: POPE = soft '
+                        'P(yes)=sigmoid(Yes−No logit) over gt=no; TriviaQA = '
+                        'mean(1−P_gold) answer-confidence. Continuous → tie-robust '
+                        '(vs the degenerate binary ΔH). Covers all backends incl. '
+                        'internvl via an lm_head capture hook.')
 
     # ── Enrichment settings (Phase 2) ─────────────────────────────
     p.add_argument('--top_k_pct', type=float, default=5.0,                 # Line 19: top K% as "hallucination-driving"
@@ -1410,30 +1416,40 @@ def build_contrastive_triviaqa_set(args, device='cuda:0'):
 
 
 def compute_triviaqa_error_rate(model, processor, tqa_questions,
-                                device, model_type, ablation_hook=None):
-    """Compute TriviaQA error rate — mirrors compute_hallucination_rate.
+                                device, model_type, ablation_hook=None,
+                                dense_scoring=False):
+    """Compute TriviaQA FACTUAL ERROR RATE (ΔErr_TQA) — the text-task analogue
+    of POPE's hallucination rate, mirroring compute_hallucination_rate.
 
-    For each question, generates a short free-text answer using a pure text
-    prompt (no image).  ΔH_TQA = ablated_error_rate − baseline_error_rate.
-    A positive ΔH_TQA means the ablated neurons were helping the model answer
-    correctly; this is the expected signal for text-specialised neurons.
+    NOTE on naming: TriviaQA does not produce hallucinations in the POPE sense —
+    a wrong answer may be fabrication, ignorance, refusal, or an alias-match miss.
+    So this is the *factual error rate*, scored as **ΔErr_TQA**, NOT "ΔH" and NOT
+    "hallucination rate". (On-disk keys/filenames keep the legacy `_tqa` names for
+    backward compatibility; only the human-facing concept is renamed.)
 
-    Args:
-        model:         loaded VLM model
-        processor:     tokenizer/processor
-        tqa_questions: list of dicts with 'question' and 'aliases' keys
-        device:        str — e.g. 'cuda:0'
-        model_type:    str — backend identifier
-        ablation_hook: optional context manager that applies neuron ablation
+    Scoring modes:
+      - binary (default): greedy generate + alias match; error = n_incorrect /
+        n_total. ΔErr_TQA = ablated error rate − baseline error rate.
+      - dense_scoring (family B): error = mean(1 − P_gold), where P_gold = max
+        over gold-alias first-token softmax probs at the answer position. The
+        text-task analogue of POPE's dense P(yes); continuous, tie-robust.
+
+    Sign convention (both modes): larger score = removing the neuron hurts the
+    task more (raises error / lowers gold-answer confidence).
 
     Returns:
-        dict with keys: error_rate, n_correct, n_incorrect, n_total
+        dict with keys: error_rate, n_correct, n_incorrect, n_total,
+                        measure, soft_error.
     """
     import torch                                                           # Line 1: inference imports
+    from contextlib import nullcontext                                     # Line 1a: no-op CM when a hook is absent
 
     n_corr  = 0                                                            # Line 2: correct answer count
     n_incor = 0                                                            # Line 3: incorrect answer count
     n_total = 0                                                            # Line 4: total questions evaluated
+    soft_err = 0.0                                                        # Line 4a: Σ (1 − P_gold) (dense_scoring)
+    _tok = _get_tokenizer(processor, model_type) if dense_scoring else None   # Line 4b: gold-token id source
+    _lm_head = _resolve_lm_head(model) if dense_scoring else None          # Line 4c: answer-position capture head
 
     model.eval()                                                           # Line 5: eval mode — disable dropout
 
@@ -1463,13 +1479,19 @@ def compute_triviaqa_error_rate(model, processor, tqa_questions,
             inputs = processor(text=pt,
                                return_tensors='pt').to(device)            # Line 15: no images= argument
         elif model_type == 'internvl':
-            import contextlib
-            cfg = dict(max_new_tokens=32, do_sample=False)
+            cfg = dict(max_new_tokens=1 if dense_scoring else 32, do_sample=False)
+            _cap = _AnswerLogitCapture(_lm_head) if (dense_scoring and _lm_head is not None) else None
             with torch.no_grad():
-                ctx = ablation_hook if ablation_hook is not None else contextlib.nullcontext()
-                with ctx:
+                _ctx_cap = _cap if _cap is not None else nullcontext()
+                _ctx_abl = ablation_hook if ablation_hook is not None else nullcontext()
+                with _ctx_cap, _ctx_abl:
                     resp = model.chat(processor, None, q_text, cfg)        # Line 16: pixel_values=None → text-only
-            is_corr = check_triviaqa_answer(resp, aliases)
+            if _cap is not None and _cap.row is not None:                  # dense: 1 − P_gold
+                p_gold = _prob_gold_from_logits(_cap.row, _first_token_ids(_tok, aliases))
+                soft_err += (1.0 - p_gold)
+                is_corr = p_gold > 0.5                                     # nominal hard label (reporting only)
+            else:                                                          # binary: alias match
+                is_corr = check_triviaqa_answer(resp, aliases)
             n_corr  += int(is_corr); n_incor += int(not is_corr); n_total += 1
             continue                                                       # Line 17: skip common generate path
         elif model_type == 'qwen2vl':
@@ -1496,68 +1518,207 @@ def compute_triviaqa_error_rate(model, processor, tqa_questions,
         else:
             continue                                                       # Line 20: skip unsupported backends
 
-        # Generate answer (greedy decoding)
+        # Generate answer — greedy decode (binary) or single-forward logit read (dense)
+        _cap = _AnswerLogitCapture(_lm_head) if (dense_scoring and _lm_head is not None) else None
         with torch.no_grad():                                              # Line 15: no gradient tracking
-            if ablation_hook is not None:                                   # Line 16: apply ablation if provided
-                with ablation_hook:
-                    out = model.generate(**inputs, max_new_tokens=32, do_sample=False)
-            else:
-                out = model.generate(**inputs, max_new_tokens=32,          # Line 17: baseline (no ablation)
+            _ctx_cap = _cap if _cap is not None else nullcontext()
+            _ctx_abl = ablation_hook if ablation_hook is not None else nullcontext()
+            with _ctx_cap, _ctx_abl:                                       # Line 16: capture + ablate as needed
+                out = model.generate(**inputs,
+                                     max_new_tokens=1 if dense_scoring else 32,
                                      do_sample=False)
 
-        # Decode generated tokens
-        if model_type == 'llava-hf':
-            generated = processor.decode(out[0], skip_special_tokens=True)
-        elif model_type in ('llava-ov', 'qwen2vl', 'idefics2', 'llava-llama3'):
-            plen = inputs['input_ids'].shape[1]
-            generated = processor.decode(out[0][plen:], skip_special_tokens=True)  # Line 18: strip prompt
-        else:
-            tok = processor[0] if isinstance(processor, tuple) else processor
-            generated = tok.decode(out[0], skip_special_tokens=True)
-
-        is_corr = check_triviaqa_answer(generated, aliases)                # Line 19: alias match
+        if _cap is not None and _cap.row is not None:                      # dense: 1 − P_gold
+            p_gold = _prob_gold_from_logits(_cap.row, _first_token_ids(_tok, aliases))
+            soft_err += (1.0 - p_gold)
+            is_corr = p_gold > 0.5                                         # nominal hard label (reporting only)
+        else:                                                              # binary: decode + alias match
+            if model_type == 'llava-hf':
+                generated = processor.decode(out[0], skip_special_tokens=True)
+            elif model_type in ('llava-ov', 'qwen2vl', 'idefics2', 'llava-llama3'):
+                plen = inputs['input_ids'].shape[1]
+                generated = processor.decode(out[0][plen:], skip_special_tokens=True)  # Line 18: strip prompt
+            else:
+                tok = processor[0] if isinstance(processor, tuple) else processor
+                generated = tok.decode(out[0], skip_special_tokens=True)
+            is_corr = check_triviaqa_answer(generated, aliases)            # Line 19: alias match
         n_corr  += int(is_corr)
         n_incor += int(not is_corr)
         n_total += 1                                                       # Line 20: increment total
 
-    error_rate = n_incor / max(n_total, 1)                                 # Line 21: fraction wrong
+    # dense_scoring: soft factual error rate (Σ (1 − P_gold) ÷ n_total).
+    if dense_scoring:                                                      # Line 21a: continuous error
+        error_rate = soft_err / max(n_total, 1)
+    else:                                                                  # Line 21b: binary error rate
+        error_rate = n_incor / max(n_total, 1)
     return {'error_rate': error_rate, 'n_correct': n_corr,               # Line 22: return results dict
-            'n_incorrect': n_incor, 'n_total': n_total}
+            'n_incorrect': n_incor, 'n_total': n_total,
+            'measure': ('dense_answer_confidence' if dense_scoring
+                        else 'binary_factual_error'),
+            'soft_error': soft_err if dense_scoring else None}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Dense answer-confidence helpers (family B): logit-margin P(yes) for POPE and
+# gold-answer confidence for TriviaQA. Single-neuron/batch ablation rarely flips
+# a discrete answer, so binary ΔH is ~all-zero and degenerate; reading the
+# answer-position logits gives a continuous signal that moves under sub-threshold
+# ablation. Model-agnostic: an lm_head forward hook grabs the prefill logits from
+# whatever generation path each backend already uses (incl. InternVL's
+# model.chat), so it covers backends that `logit_scoring` (HF-only) does not.
+# ═══════════════════════════════════════════════════════════════════════
+
+def _resolve_lm_head(model):
+    """Return the language-model head Linear, or None if not found."""
+    if hasattr(model, 'lm_head'):                                          # most HF causal-LM wrappers
+        return model.lm_head
+    lm = getattr(model, 'language_model', None)                            # VLM nests the LM (e.g. InternVL)
+    if lm is not None and hasattr(lm, 'lm_head'):
+        return lm.lm_head
+    for name, mod in model.named_modules():                                # fallback — search by name
+        if name.endswith('lm_head'):
+            return mod
+    return None                                                            # caller falls back to binary
+
+
+def _get_tokenizer(processor, model_type):
+    """Extract the text tokenizer from a processor/tuple/tokenizer."""
+    if isinstance(processor, tuple):                                       # llava-liuhaotian → (tok, img_proc)
+        return processor[0]
+    if hasattr(processor, 'tokenizer'):                                    # HF processors wrap a tokenizer
+        return processor.tokenizer
+    return processor                                                       # internvl passes the tokenizer itself
+
+
+def _yes_no_token_ids(tokenizer):
+    """First-token ids for yes/no answer-word variants → (yes_ids, no_ids) sets."""
+    yes_ids, no_ids = set(), set()
+    variants = {'yes': ['Yes', 'yes', ' Yes', ' yes'],
+                'no':  ['No',  'no',  ' No',  ' no']}
+    for word, forms in variants.items():
+        target = yes_ids if word == 'yes' else no_ids
+        for form in forms:
+            try:
+                ids = tokenizer.encode(form, add_special_tokens=False)
+            except Exception:
+                continue
+            if ids:
+                target.add(ids[0])
+    return yes_ids, no_ids
+
+
+def _first_token_ids(tokenizer, surface_forms):
+    """First-token ids for a set of surface forms (used for TQA gold aliases)."""
+    ids = set()
+    for form in surface_forms:
+        for variant in (form, ' ' + form):                                # with and without leading space
+            try:
+                enc = tokenizer.encode(variant, add_special_tokens=False)
+            except Exception:
+                continue
+            if enc:
+                ids.add(enc[0])
+    return ids
+
+
+def _prob_yes_from_logits(logits_row, yes_ids, no_ids):
+    """P(yes) = sigmoid(max yes-logit − max no-logit) at the answer position.
+
+    Returns (p_yes: float in [0,1], pred_yes: bool). Falls back to 0.5/False
+    when neither token set is present (keeps the question scoreable).
+    """
+    import torch
+    yl = [logits_row[i] for i in yes_ids if i < logits_row.shape[0]]
+    nl = [logits_row[i] for i in no_ids  if i < logits_row.shape[0]]
+    if not yl or not nl:
+        return 0.5, False
+    margin = torch.stack(yl).max() - torch.stack(nl).max()
+    p_yes = torch.sigmoid(margin.float()).item()
+    return p_yes, bool(margin.item() > 0)
+
+
+def _prob_gold_from_logits(logits_row, gold_first_ids):
+    """P(gold first token) = max over gold-alias first-token softmax probs.
+
+    Returns p_gold in [0,1] (0.0 if no gold token resolvable). This is the dense
+    TQA confidence signal; error = 1 − p_gold mirrors POPE's P(yes).
+    """
+    import torch
+    ids = [i for i in gold_first_ids if i < logits_row.shape[0]]
+    if not ids:
+        return 0.0
+    probs = torch.softmax(logits_row.float(), dim=-1)
+    return float(probs[ids].max().item())
+
+
+class _AnswerLogitCapture:
+    """Context manager: capture the answer-position logits from lm_head's
+    first (prefill) call during a generation, regardless of backend."""
+    def __init__(self, lm_head):
+        self.lm_head = lm_head
+        self.row = None                                                   # (vocab,) logits at last prompt pos
+        self._handle = None
+
+    def __enter__(self):
+        def hook_fn(module, inp, output):
+            if self.row is not None:                                      # keep only the first (prefill) call
+                return
+            out = output[0] if isinstance(output, tuple) else output
+            if out.dim() == 3:                                            # (batch, seq, vocab) → last position
+                self.row = out[0, -1, :].detach()
+            elif out.dim() == 2:                                          # (seq|batch, vocab) → last row
+                self.row = out[-1, :].detach()
+            else:
+                self.row = out.detach().reshape(-1)
+        self._handle = self.lm_head.register_forward_hook(hook_fn)
+        return self
+
+    def __exit__(self, *a):
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
 
 
 def compute_hallucination_rate(model, processor, pope_questions,
                                pope_img_dir, device, model_type,
-                               ablation_hook=None, logit_scoring=False):
+                               ablation_hook=None, logit_scoring=False,
+                               dense_scoring=False):
     """Run POPE evaluation and compute hallucination rate.
 
     For each yes/no question, generates the model's answer and checks
     if the model says "yes" when the ground truth is "no" (hallucination).
 
-    Args:
-        model: loaded VLM model
-        processor: tokenizer/processor for the model
-        pope_questions: list of POPE question dicts
-        pope_img_dir: directory with COCO val images
-        device: torch device string (e.g. "cuda:0")
-        model_type: backend identifier string
-        ablation_hook: optional context manager that applies neuron ablation
+    Scoring modes:
+      - binary (default): generate text, count false-yes on gt=no questions.
+      - logit_scoring: fast single-forward Yes/No argmax (HF backends) — still
+        a BINARY rate, just no autoregressive decode.
+      - dense_scoring (family B): soft hallucination rate = mean
+        P(yes)=sigmoid(maxYesLogit − maxNoLogit) over gt=no questions, read at
+        the answer position (HF fast path, or lm_head capture for InternVL).
+        Continuous → does not collapse to ties under single-batch ablation.
 
     Returns:
         dict with keys: hallucination_rate, accuracy, n_correct, n_total,
-                        n_hallucinated (said yes when answer is no)
+                        n_hallucinated, measure, soft_hallucination.
     """
     import torch                                                           # Line 1: import here to avoid top-level GPU init
     from PIL import Image                                                  # Line 2: image loading
+    from contextlib import nullcontext                                     # Line 2a: no-op CM when a hook is absent
 
     n_correct = 0                                                          # Line 3: count of correct predictions
     n_hallucinated = 0                                                     # Line 4: count of false "yes" answers
     n_total = 0                                                            # Line 5: total questions evaluated
+    soft_halluc = 0.0                                                     # Line 5a: Σ P(yes) over gt=no (dense_scoring)
 
     model.eval()                                                           # Line 6: ensure eval mode
 
-    # Precompute "Yes"/"No" first-token ids once when logit scoring is enabled.
-    _yes_ids = _no_ids = None                                              # Line 6a: default = disabled
-    if logit_scoring:                                                      # Line 6b: build id tensors for the fast path
+    # Precompute "Yes"/"No" first-token ids when scoring from logits (fast-binary
+    # logit_scoring OR dense_scoring). Tensors feed the HF fast path; sets feed the
+    # lm_head-capture path used for InternVL under dense_scoring.
+    _yes_ids = _no_ids = None                                              # Line 6a: HF-path id tensors
+    _yes_set, _no_set = set(), set()                                       # Line 6a2: capture-path id sets
+    _lm_head = _resolve_lm_head(model) if dense_scoring else None          # Line 6a3: InternVL capture head
+    if logit_scoring or dense_scoring:                                     # Line 6b: build id tensors for the fast path
         _tok = getattr(processor, 'tokenizer', processor)                 # Line 6c: HF processors expose .tokenizer
         if isinstance(_tok, tuple):                                       # Line 6d: llava-liuhaotian packs (tokenizer, img_proc)
             _tok = _tok[0]
@@ -1570,6 +1731,7 @@ def compute_hallucination_rate(model, processor, pope_questions,
             return sorted(_ids)
         _yes_ids = torch.tensor(_first_ids(['Yes', ' Yes', 'yes', ' yes', 'YES']), device=device)  # Line 6f
         _no_ids  = torch.tensor(_first_ids(['No', ' No', 'no', ' no', 'NO']), device=device)        # Line 6g
+        _yes_set, _no_set = _yes_no_token_ids(_tok)                       # Line 6h: id sets for capture path
 
     for q in pope_questions:                                               # Line 7: iterate over POPE questions
         img_filename = q['image']                                          # Line 8: e.g. "COCO_val2014_000000XXXXXX.jpg"
@@ -1628,15 +1790,23 @@ def compute_hallucination_rate(model, processor, pope_questions,
             ])
             pixel_values = _tf(img).unsqueeze(0).to(torch.bfloat16).to(device)
             question_prompt = f'<image>\n{question_text}'
-            generation_config = dict(max_new_tokens=10, do_sample=False)
+            # dense_scoring: max_new_tokens=1 (only the prefill matters; the
+            # lm_head hook captures the answer-position logits).
+            generation_config = dict(max_new_tokens=1 if dense_scoring else 10,
+                                     do_sample=False)
+            _cap = _AnswerLogitCapture(_lm_head) if (dense_scoring and _lm_head is not None) else None
             with torch.no_grad():
-                if ablation_hook is not None:
-                    with ablation_hook:
-                        response = model.chat(processor, pixel_values, question_prompt, generation_config)
-                else:
+                _ctx_cap = _cap if _cap is not None else nullcontext()
+                _ctx_abl = ablation_hook if ablation_hook is not None else nullcontext()
+                with _ctx_cap, _ctx_abl:
                     response = model.chat(processor, pixel_values, question_prompt, generation_config)
-            answer = response.strip().lower()
-            pred_yes = 'yes' in answer
+            if _cap is not None and _cap.row is not None:                  # dense scoring
+                p_yes, pred_yes = _prob_yes_from_logits(_cap.row, _yes_set, _no_set)
+                if gt_answer == 'no':
+                    soft_halluc += p_yes
+            else:                                                          # binary scoring (original)
+                answer = response.strip().lower()
+                pred_yes = 'yes' in answer
             if (pred_yes and gt_answer == 'yes') or (not pred_yes and gt_answer == 'no'):
                 n_correct += 1
             if pred_yes and gt_answer == 'no':
@@ -1676,8 +1846,10 @@ def compute_hallucination_rate(model, processor, pope_questions,
         else:
             continue                                                       # skip unsupported model types
 
-        # ── Fast path: single-forward yes/no logit scoring (no decode) ──
-        if logit_scoring and model_type in (                               # Line 28a: HF-style backends only
+        # ── Fast path: single-forward yes/no logit read (no decode) ──
+        # Used by fast-binary logit_scoring AND by dense_scoring; the difference
+        # is only how the read is scored (hard argmax vs soft P(yes)).
+        if (logit_scoring or dense_scoring) and model_type in (            # Line 28a: HF-style backends only
                 'llava-hf', 'llava-ov', 'qwen2vl', 'idefics2', 'llava-llama3'):
             with torch.no_grad():                                          # Line 28b: one forward, no autoregressive loop
                 if ablation_hook is not None:                              # Line 28c: apply ablation if scoring ablated
@@ -1689,6 +1861,8 @@ def compute_hallucination_rate(model, processor, pope_questions,
             yes_logit = next_logits[_yes_ids].max()                       # Line 28e: best "yes"-variant logit
             no_logit  = next_logits[_no_ids].max()                        # Line 28f: best "no"-variant logit
             pred_yes = bool(yes_logit >= no_logit)                        # Line 28g: predicted yes iff yes outscores no
+            if dense_scoring and gt_answer == 'no':                       # Line 28g2: soft P(yes) on gt=no
+                soft_halluc += torch.sigmoid((yes_logit - no_logit).float()).item()
             if (pred_yes and gt_answer == 'yes') or \
                (not pred_yes and gt_answer == 'no'):                       # Line 28h: correct if matches ground truth
                 n_correct += 1
@@ -1730,7 +1904,13 @@ def compute_hallucination_rate(model, processor, pope_questions,
             n_hallucinated += 1
         n_total += 1                                                       # Line 43: increment total counter
 
-    hallucination_rate = n_hallucinated / max(n_total, 1)                  # Line 44: fraction of hallucinated answers
+    # dense_scoring: soft hallucination rate (Σ P(yes) over gt=no ÷ n_total) —
+    # same scale/denominator as the binary rate but continuous, so single-batch
+    # ablation yields dense, tie-free ΔH (family B).
+    if dense_scoring:                                                      # Line 44a: continuous rate
+        hallucination_rate = soft_halluc / max(n_total, 1)
+    else:                                                                  # Line 44b: original binary rate
+        hallucination_rate = n_hallucinated / max(n_total, 1)
     accuracy = n_correct / max(n_total, 1)                                 # Line 45: overall accuracy
 
     return {                                                               # Line 46: return evaluation results
@@ -1739,6 +1919,9 @@ def compute_hallucination_rate(model, processor, pope_questions,
         'n_correct': n_correct,
         'n_hallucinated': n_hallucinated,
         'n_total': n_total,
+        'measure': ('dense_logit_margin' if dense_scoring                  # Line 46a: which signal was used
+                    else 'logit_binary' if logit_scoring else 'binary'),
+        'soft_hallucination': soft_halluc if dense_scoring else None,      # Line 46b: Σ P(yes) over gt=no
     }
 
 
@@ -1911,7 +2094,8 @@ def ablation_worker(gpu_id, layer_range, args, return_dict):
     baseline = compute_hallucination_rate(                                 # Line 19: evaluate without ablation
         model, processor, pope_questions,
         args.pope_img_dir, device, args.model_type,
-        logit_scoring=getattr(args, 'logit_pope_scoring', False))
+        logit_scoring=getattr(args, 'logit_pope_scoring', False),
+        dense_scoring=getattr(args, 'dense_scoring', False))
     baseline_hr = baseline['hallucination_rate']                           # Line 20: extract baseline hallucination rate
     print(f'[GPU {gpu_id}] Baseline hallucination rate: {baseline_hr:.4f} '
           f'({baseline["n_hallucinated"]}/{baseline["n_total"]})')
@@ -1927,7 +2111,8 @@ def ablation_worker(gpu_id, layer_range, args, return_dict):
                 tqa_questions = [json.loads(l) for l in _f if l.strip()]   # Line 20f: parse JSONL
             print(f'[GPU {gpu_id}] Loaded {len(tqa_questions)} TriviaQA contrastive questions')
             baseline_tqa = compute_triviaqa_error_rate(                    # Line 20g: baseline error rate on TriviaQA
-                model, processor, tqa_questions, device, args.model_type)
+                model, processor, tqa_questions, device, args.model_type,
+                dense_scoring=getattr(args, 'dense_scoring', False))
             baseline_tqa_er = baseline_tqa['error_rate']                   # Line 20h: store float baseline
             print(f'[GPU {gpu_id}] Baseline TriviaQA error rate: '
                   f'{baseline_tqa_er:.4f} ({baseline_tqa["n_incorrect"]}/{baseline_tqa["n_total"]})')
@@ -2007,7 +2192,8 @@ def ablation_worker(gpu_id, layer_range, args, return_dict):
                 model, processor, pope_questions,
                 args.pope_img_dir, device, args.model_type,
                 ablation_hook=hook,
-                logit_scoring=getattr(args, 'logit_pope_scoring', False))
+                logit_scoring=getattr(args, 'logit_pope_scoring', False),
+                dense_scoring=getattr(args, 'dense_scoring', False))
 
             delta_h = ablated['hallucination_rate'] - baseline_hr          # Line 47: compute ΔH (positive = more hallucinations)
 
@@ -2018,8 +2204,9 @@ def ablation_worker(gpu_id, layer_range, args, return_dict):
                     model, processor, tqa_questions, device, args.model_type,
                     ablation_hook=AblationHook(model, layer_name,
                                                batch_start, batch_end,
-                                               args.ablation_method))
-                delta_h_tqa = ablated_tqa['error_rate'] - baseline_tqa_er  # Line 47d: ΔH_TQA (positive = neuron helped text recall)
+                                               args.ablation_method),
+                    dense_scoring=getattr(args, 'dense_scoring', False))
+                delta_h_tqa = ablated_tqa['error_rate'] - baseline_tqa_er  # Line 47d: ΔErr_TQA (positive = neuron helped text recall)
 
             # Assign ΔH equally to each neuron in the batch (approximation)
             per_neuron_delta     = delta_h     / batch_size                # Line 48: distribute ΔH_POPE equally across batch
@@ -2223,10 +2410,33 @@ def compute_enrichment(flat_labels, neuron_scores, top_k_pct,
     print(f'Score range in driving set: [{score_array[driving_indices].min():.6f}, '
           f'{score_array[driving_indices].max():.6f}]')
 
+    # ── Guard: degenerate (tied) driving set ──────────────────────
+    # Single-neuron/batch ablation on a binary task (POPE yes/no, TQA alias-match)
+    # almost never flips an answer, so the score array can be ~all-zero. When the
+    # top-k boundary falls inside a block of identical values, which neurons land
+    # "inside" vs "outside" is decided by np.argsort's index order, NOT by the
+    # score — the odds ratios then reflect the modality mix of the highest-index
+    # (last) layers, an artifact. Detect and flag (the binary family is expected
+    # to trip this; the dense family is the primary result when it does).
+    drv_vals = score_array[driving_indices]                                # values of the selected driving set
+    thresh = float(drv_vals.min())                                         # value of the k-th largest score
+    n_at_thresh_in_drv  = int((drv_vals == thresh).sum())                  # driving neurons tied at the boundary
+    n_at_thresh_total   = int((score_array == thresh).sum())               # all neurons sharing that value
+    degenerate = (float(drv_vals.max()) == thresh                          # entire driving set is one tied value, or…
+                  or n_at_thresh_in_drv > 0.5 * n_driving)                 # …>half the set sits on the boundary tie
+    if degenerate:                                                         # warn loudly; ranking is not valid
+        print(f'  ⚠️  WARNING: degenerate driving set — {n_at_thresh_in_drv:,}/{n_driving:,} '
+              f'driving neurons are tied at the boundary value {thresh:.3g} '
+              f'({n_at_thresh_total:,} neurons share it). The top-{top_k_pct}% '
+              f'selection is decided by argsort index tie-break, not by the score; '
+              f'these odds ratios are NOT a valid ranking (the dense family is the '
+              f'primary result for this combo).')
+
     # ── Enrichment for each modality category ─────────────────────
     categories = ['visual', 'text', 'multimodal', 'unknown']              # Line 13: categories to test
     results = {'top_k_pct': top_k_pct, 'n_driving': n_driving,            # Line 14: store metadata
-               'n_total': n_total, 'categories': {}}
+               'n_total': n_total, 'degenerate_driving_set': bool(degenerate),
+               'categories': {}}
 
     for cat in categories:                                                 # Line 15: iterate over categories
         cat_mask = (flat_labels == cat)                                    # Line 16: boolean mask for this category

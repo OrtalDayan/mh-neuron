@@ -220,6 +220,7 @@ HALLUC_ENCODER_PROJECTOR="1"       # encoder/projector neuron scoring — on by 
 HALLUC_PLOT_ONLY=""               # set to "1" to only regenerate plots from existing results (no GPU needed)
 HALLUC_MERGE_ONLY=""              # set to "1" to skip splits/preprocess/layers, only run merge (data must exist)
 HALLUC_LOGIT_POPE=""              # set to "1" for fast single-forward yes/no POPE logit scoring (HF backends; internvl unaffected)
+HALLUC_DENSE=""                   # set to "1" for family-B DENSE scoring (soft P(yes) POPE + 1-P_gold TQA); routes to a /dense subdir + _dn job names so it never collides with the binary campaign
 
 # ── Step 11 (steering) settings ──
 STEERING_ALPHAS="0,0.25,0.5,0.75,1.5,2.0,2.5,3.0"   # comma-separated alpha values
@@ -378,6 +379,7 @@ while [[ $# -gt 0 ]]; do
         --no-halluc-triviaqa) HALLUC_TRIVIAQA=""; shift 1 ;;
         --halluc-logit-pope) HALLUC_LOGIT_POPE="1"; shift 1 ;;
         --no-halluc-logit-pope) HALLUC_LOGIT_POPE=""; shift 1 ;;
+        --halluc-dense) HALLUC_DENSE="1"; shift 1 ;;
         --no-encoder-projector) HALLUC_ENCODER_PROJECTOR=""; shift 1 ;;
         --halluc-plot-only) HALLUC_PLOT_ONLY="1"; shift 1 ;;
         --halluc-merge-only) HALLUC_MERGE_ONLY="1"; shift 1 ;;
@@ -3068,8 +3070,16 @@ else
     _HS_COMBO_SUBDIR="/${HS_TAXONOMY}${_HOOK_SUFFIX}"
     _HS_COMBO_JOB="${_HOOK_SHORT}"; [[ "$HS_TAXONOMY" == "ft" ]] && _HS_COMBO_JOB="${_HS_COMBO_JOB}_ft"
 fi
+# Family-B dense scoring: isolate into a /dense segment + _dn job-name suffix so
+# the dense ablation_scores never overwrite the binary ones (family A) and never
+# collide with the live binary campaign's job names.
+_HS_DENSE_SEG=""
+if [[ "$HALLUC_DENSE" == "1" ]]; then
+    _HS_DENSE_SEG="/dense"
+    _HS_COMBO_JOB="${_HS_COMBO_JOB}_dn"
+fi
 
-HALLUC_SCORES_DIR="results/10-halluc_scores/${CLASSIFY_MODE_DIR}/${MODEL_NAME}${_HS_COMBO_SUBDIR}"
+HALLUC_SCORES_DIR="results/10-halluc_scores/${CLASSIFY_MODE_DIR}/${MODEL_NAME}${_HS_DENSE_SEG}${_HS_COMBO_SUBDIR}"
 mkdir -p "$WORK_DIR/$HALLUC_SCORES_DIR"
 
 # Neurons per FFN layer = total LLM neurons (line ~596 map) / number of layers.
@@ -3116,6 +3126,7 @@ HS_COMMON_ARGS="$HS_COMMON_ARGS --n_pope_questions $HS_N_POPE"
 HS_COMMON_ARGS="$HS_COMMON_ARGS --output_dir $HALLUC_SCORES_DIR"
 HS_COMMON_ARGS="$HS_COMMON_ARGS --top_k_pct 5.0 --batch_neurons $HS_BATCH_NEURONS"
 [[ "$HALLUC_LOGIT_POPE" == "1" ]] && HS_COMMON_ARGS="$HS_COMMON_ARGS --logit_pope_scoring"
+[[ "$HALLUC_DENSE" == "1" ]] && HS_COMMON_ARGS="$HS_COMMON_ARGS --dense_scoring"
 if [[ "$HALLUC_CONTRASTIVE" == "1" ]]; then
     HS_COMMON_ARGS="$HS_COMMON_ARGS --contrastive"
     [[ "$MODE" == "test" ]] && HS_COMMON_ARGS="$HS_COMMON_ARGS --contrastive_start_per_split 5 --contrastive_samples 2 --contrastive_cap_per_split 3"
