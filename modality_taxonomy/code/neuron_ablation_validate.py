@@ -2113,6 +2113,25 @@ def parse_args():
                         'When provided, top_n/curve ranks neurons by halluc '
                         'score within each category instead of classification '
                         'confidence or CETT. Format: {"layer_neuron": score}')
+    p.add_argument('--halluc_scores_tqa_path', default=None,
+                   help='Path to TriviaQA-based hallucination scores JSON from '
+                        'step 10 (ablation_scores_delta_h_tqa.json). Intended '
+                        'to rank text neurons by ΔH_TQA instead of the POPE '
+                        'ranking. Accepted but not yet used by the ranking '
+                        'logic (passed by run_pipeline.sh when the file '
+                        'exists).')
+    p.add_argument('--halluc_scores_encoder_path', default=None,
+                   help='Path to per-neuron encoder hallucination scores JSON '
+                        'from step 10 (*_encoder.json). Intended for '
+                        'neuron-level encoder steering. Accepted but not yet '
+                        'used (ablate_encoder scales whole modules; passed by '
+                        'run_pipeline.sh when the file exists).')
+    p.add_argument('--halluc_scores_projector_path', default=None,
+                   help='Path to per-neuron projector hallucination scores '
+                        'JSON from step 10 (*_projector.json). Intended for '
+                        'neuron-level projector steering. Accepted but not yet '
+                        'used (ablate_projector scales the whole module; '
+                        'passed by run_pipeline.sh when the file exists).')
 
     # Sharding: run only a slice of the (condition × top_n) runs
     p.add_argument('--start_idx', type=int, default=None,
