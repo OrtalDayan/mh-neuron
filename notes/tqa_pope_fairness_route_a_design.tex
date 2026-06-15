@@ -1,0 +1,208 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.0cm]{geometry}
+\usepackage{parskip}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\newcommand{\code}[1]{\texttt{#1}}
+\title{Route A: Matched Dense-Confidence Enrichment\\for POPE \& TriviaQA --- Design}
+\author{MH-Neuron / Modality Taxonomy}
+\date{June 2026 --- design note (pending approval to implement)}
+\begin{document}
+\maketitle
+
+\noindent This note explains the ``Route A'' fairness fix for putting the POPE and
+TriviaQA enrichment legs on equal footing, per the fairness spec. It is a design
+description; no code has been changed and no jobs have been launched.
+
+\section{The core problem it fixes}
+Single-batch ablation almost never flips a \emph{discrete} outcome (a yes/no answer,
+or an alias match), so the binary $\Delta H$ is $\sim$all-zero and the top-5\%
+``driving'' set collapses to an \code{argsort} tie-break --- the degeneracy guard
+fires for \emph{both} legs. Route A replaces each leg's discrete metric with a
+\textbf{continuous answer-confidence probability} read directly off the LM head, so
+every ablated batch moves the score a little: dense, tie-free $\Delta H$, hence a real
+ranking for Fisher's exact test.
+
+\section{What the dense metric is, concretely}
+When the model answers, it first assigns a \textbf{probability to each possible answer}
+(how confident it is), then picks the highest. For a POPE question \emph{``Is there a cat in
+this image?''} with truth \textbf{no}, it might compute $P(\text{``yes''})=0.10$,
+$P(\text{``no''})=0.90$, and pick ``no'' (correct).
+
+\textbf{Binary metric (old).} Look only at the final \emph{pick}: yes or no, a $0/1$
+outcome. Ablate 50 neurons and re-ask: now $P(\text{``yes''})=0.13$,
+$P(\text{``no''})=0.87$ --- still picks ``no.'' Binary records that the pick did not change,
+so effect $=0$. The model leaned further toward hallucinating, but binary sees nothing. This
+happens for almost every batch, giving a field of zeros that cannot be ranked.
+
+\textbf{Dense metric (new).} Read the \emph{probability itself}: $P(\text{``yes''})$ went
+$0.10 \to 0.13$, so effect $=+0.03$ --- a real, measurable number, even though the answer
+never flipped.
+
+So the dense metric is simply: \textbf{measure the model's confidence (a number in $[0,1]$),
+not its yes/no verdict.}
+\begin{itemize}[nosep]
+\item \textbf{POPE:} confidence $=P(\text{``yes''})$ on a no-truth question $=$ how much it
+leans toward hallucinating.
+\item \textbf{TQA:} confidence $=P(\text{correct answer word})$ $=$ how much it leans toward
+the right answer.
+\end{itemize}
+Average this over $\sim$1000 questions, with and without the ablation; the difference is
+$\Delta H$. \textbf{Binary} is $\sim$always exactly $0$ (a flat field, nothing to rank);
+\textbf{dense} is a small real number for every batch ($0.03,\,-0.01,\,0.008,\dots$), so the
+batches that move confidence most can be ranked. The shift is from asking ``did the answer
+change?'' to ``how much did the model's confidence move?'' --- same ablation, more sensitive
+measurement.
+
+\section{Why dense fixes it, in plain terms}
+Think of measuring how much one lecture matters to a student.
+\begin{itemize}[nosep]
+\item \textbf{Binary} asks: ``did the student pass or fail?'' Skipping one lecture out of
+hundreds almost never flips pass$\to$fail, so for nearly every lecture the answer is ``no
+change.'' If thousands of lectures all read ``no change,'' you cannot tell which one
+mattered --- the ranking is empty, and ``top 5\%'' just picks whichever happen to come
+first in the list (an artifact). That is binary $\Delta H$: removing 50 of $\sim$11{,}000
+neurons rarely changes the actually-chosen word or yes/no, so almost every batch scores
+exactly~$0$.
+\item \textbf{Dense} asks: ``did the exam score move from 91 to 89?'' Even when the student
+still passes, you see each lecture's effect as a small change in the score. That is the
+confidence probability: even when the model still says the same answer, removing 50 neurons
+nudges the \emph{probability} it assigned --- say from $0.91$ to $0.89$. The nudge is
+measurable and different for every batch, so the batches that move confidence most can be
+ranked. No mass tie, real ranking, guard off.
+\end{itemize}
+The fix is not a finer scalpel; it is a more sensitive ruler applied to the same cut.
+
+\section{The shared mechanism (already built for POPE)}
+\code{\_AnswerLogitCapture} registers a forward hook on the model's \code{lm\_head}.
+During a single forward (the prefill, \code{max\_new\_tokens=1}) it captures the logits
+at the \textbf{answer position} --- the last prompt token, whose next-token
+distribution \emph{is} the model's answer. This works uniformly across backends
+(including InternVL's \code{model.chat}) because they all call \code{lm\_head} once on
+the prefill. It runs \emph{inside} the ablation context manager, so the captured logits
+are the \textbf{ablated} answer distribution.
+
+\section{POPE leg (exists: \code{halluc\_measure='logit\_margin'})}
+Per POPE question, at the answer position:
+\begin{itemize}[nosep]
+\item $P(\text{yes}) = \sigma\!\big(\text{logit}[\text{``Yes''}] - \text{logit}[\text{``No''}]\big)$ ---
+continuous probability the model gives the hallucinated ``yes''.
+\item Hallucination score $=$ mean of $P(\text{yes})$ over the \textbf{gt$=$no} questions
+(a \emph{soft} false-positive rate).
+\item $\Delta H_{\text{POPE}} = \text{soft\_rate}(\text{ablated}) - \text{soft\_rate}(\text{baseline})$.
+\end{itemize}
+
+\section{TQA leg (the new piece --- in \code{compute\_triviaqa\_error\_rate})}
+Currently TQA generates 32 tokens and alias-matches (binary). The new dense mode mirrors
+POPE exactly:
+\begin{itemize}[nosep]
+\item Each TQA question has gold \code{aliases} (e.g.\ \code{["New York", "NYC"]}); take the
+\textbf{first token} of each alias.
+\item At the answer position, $P_{\text{gold}} = \max_{\text{alias}}
+\operatorname{softmax}(\text{logits})[\,\text{first\_token(alias)}\,]$ --- the model's
+confidence it is about to start the correct answer.
+\item Per-question \textbf{error} $= 1 - P_{\text{gold}}$ (mirrors POPE's $P(\text{yes})$, the
+probability of the \emph{wrong} outcome).
+\item TQA score $=$ mean error over questions; $\Delta H_{\text{TQA}} =
+\text{error\_rate}(\text{ablated}) - \text{error\_rate}(\text{baseline})$.
+\end{itemize}
+It reuses the \emph{same} \code{\_AnswerLogitCapture}/\code{lm\_head} hook and
+\code{\_get\_tokenizer} machinery --- no new generation, just one forward per
+(batch, question) reading the gold-token probability.
+
+\section{Why this is a \emph{matched} pair}
+Both legs are now: \emph{``answer-position softmax probability of the key answer token,
+aggregated over the contrastive set, differenced under ablation.''} POPE tracks
+$P(\text{wrong ``yes''})$; TQA tracks $1 - P(\text{right answer})$. Both are continuous
+$[0,1]$ confidences from the same hook, so an OR$>$1 on one task and OR$<$1 on the other
+reflects modality, not a metric-shape artifact. One minor asymmetry, documented: POPE's
+$P(\text{yes})$ is a 2-way Yes/No softmax while TQA's $P_{\text{gold}}$ competes against the
+full vocabulary --- but enrichment uses only the \emph{ranking} of $\Delta H$ within a
+model, which is scale-invariant under Fisher, so this does not bias the comparison.
+
+\section{Sign convention (matched)}
+For both legs, \textbf{larger $\Delta H$ $=$ removing this neuron damages the task more}
+(POPE: ablation raises $P(\text{yes})$/hallucination; TQA: ablation raises error / lowers gold
+confidence). \code{compute\_enrichment} takes the top-$k$ \emph{largest}, so both put the
+``most task-protective neurons'' at the top. Identical orientation.
+
+\section{Matched intervention \& enrichment path (unchanged)}
+\begin{itemize}[nosep]
+\item Same \code{ablation\_worker}, same batch-of-50 gate-hook zeroing ---
+$\Delta H_{\text{POPE}}$ and $\Delta H_{\text{TQA}}$ are computed in the \emph{same pass} per
+batch, so granularity is identical.
+\item Both scored through the \emph{same} \code{compute\_enrichment} (same
+\code{top\_k\_pct=5}, same \code{flat\_labels} neuron universe, same
+\code{n\_random\_trials=1000}, same \code{seed}), emitting \code{enrichment\_results.json}
+$+$ \code{enrichment\_results\_tqa.json} from one run: guaranteed parameter-matched.
+\item \code{compute\_enrichment}'s statistics, top-$k$ logic, and random baseline are
+\textbf{not} touched (spec hard constraint).
+\end{itemize}
+
+\section{Resolution: 50 neurons at a time}
+Both legs share the same intervention: each ablation zeros a contiguous block of 50
+neurons at the gate hook. Per block, in one pass,
+\[
+\Delta H_{\text{POPE}} = \overline{P(\text{yes})}^{\;\text{ablated}}_{\,gt=no}
+   - \overline{P(\text{yes})}^{\;\text{baseline}}_{\,gt=no},
+\qquad
+\Delta H_{\text{TQA}} = \overline{(1-P_{\text{gold}})}^{\;\text{ablated}}
+   - \overline{(1-P_{\text{gold}})}^{\;\text{baseline}} ,
+\]
+i.e.\ $\Delta H_{\text{POPE}}$ is the change in mean $P(\text{yes})$ over the gt$=$no
+questions, and $\Delta H_{\text{TQA}}$ is the change in mean $(1-P_{\text{gold}})$ over the
+TQA questions. The block's $\Delta H$ is then split equally among its 50 neurons, so all 50
+share one score (but keep their own modality labels). The effective resolution is therefore
+\textbf{per-50-neuron block}, not single-neuron --- and the dense metric removes the
+degeneracy at exactly that block level: binary makes nearly every block read $0$
+(unrankable); dense gives every block a distinct continuous value (rankable). The only
+leftover tie is the single block straddling the top-5\% cutoff ($\sim$50 neurons), far
+below the guard's $>$50\%-tied threshold. Single-neuron ablation would be $50\times$ more
+forward passes \emph{and} would unmatch the two legs, so it is intentionally not used.
+
+\section{Contrastive filtering parity (spec \S2)}
+Verify \code{build\_contrastive\_triviaqa\_set} uses the same $K$-samples / temperature /
+consistency criterion / cap as POPE's $K=10$ at $T=0.7$, $\sim$1000 cap --- align or
+document any difference, and report both retained-set sizes side by side.
+
+\section{What actually runs on waic-risk}
+One control flag (\code{--halluc\_measure logit\_margin}) flips \emph{both} legs to dense.
+Then a fresh step-10 per model: \code{--long-desc} ($\alpha{=}0.001$/max-300 labels)
+\code{--halluc\_triviaqa --contrastive}, per-layer ablation jobs (36 for qwen-3b)
+recomputing dense $\Delta H$ for both legs $\to$ aggregate $\to$ matched enrichment.
+\begin{itemize}[nosep]
+\item \textbf{qwen2.5-vl-3b: clean} --- no active step-10 jobs; runs immediately.
+\item \textbf{internvl \& llava-ov: collision} --- their binary campaign is live and writes
+the same \code{ablation\_scores*.json} paths. The dense runs are routed to a
+\textbf{separate (suffixed) output location} so the running campaign is neither clobbered
+nor raced; existing binary results stay intact.
+\end{itemize}
+
+\section{Code changes (scoped)}
+\begin{enumerate}[nosep]
+\item \code{compute\_triviaqa\_error\_rate}: add the dense gold-confidence mode (the only
+substantive new code).
+\item Thread the measure into the TQA call in \code{ablation\_worker} (POPE side already
+wired).
+\item A small \code{run\_pipeline.sh} plumbing line so \code{HALLUC\_MEASURE=logit\_margin}
+reaches both legs.
+\item Verify/align the TQA contrastive builder parameters.
+\end{enumerate}
+No changes to enrichment statistics, labels, or descriptions.
+
+\section{Risks}
+\begin{enumerate}[nosep]
+\item It is a real GPU campaign (3 models $\times$ per-layer) on a busy cluster.
+\item internvl/llava-ov need the separate-output handling to avoid the live campaign.
+\item The dense TQA metric is a \emph{new} signal --- validate it is non-degenerate
+(guard off) on qwen-3b first before trusting/expanding.
+\item Results may still show no clean dissociation; per the spec that is a valid outcome,
+reported as-is. This is a neutral fairness fix, not an attempt to produce a dissociation.
+\end{enumerate}
+
+\end{document}

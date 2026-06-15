@@ -1,0 +1,109 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{parskip}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{titlesec}
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+
+\title{Implementation Explanations\\[0.4em]\large The Enrichment Analysis (Pipeline Step 10)}
+\author{MH-Neuron / Modality Taxonomy project}
+\date{June 10, 2026}
+
+\begin{document}
+\maketitle
+
+The enrichment analysis is the experiment that tests whether the neuron labels the
+pipeline produces actually mean something causally, not just statistically. Here is
+the whole thing in plain words, start to finish.
+
+\section*{The starting point}
+
+By this stage of the pipeline, every neuron in the language model's feed-forward
+layers has already been given a label --- visual, text, multimodal, or unknown ---
+based on \emph{when it tends to fire}: neurons that activate mostly on image-derived
+tokens are called visual, those that activate mostly on language tokens are called
+text, and so on. But firing patterns are only correlations. A neuron that fires on
+visual tokens might still contribute nothing to the model's visual understanding.
+The enrichment analysis asks the causal question: if we actually \emph{remove} these
+neurons, does the model's behavior break in the way the labels predict?
+
+\section*{The behavioral yardstick}
+
+The behavior chosen is hallucination --- specifically, object hallucination measured
+by POPE, a benchmark of simple yes-or-no questions like ``Is there a dog in this
+image?'' asked about real photographs. A model hallucinates when it confidently says
+yes to an object that isn't there. The intuition is that if visual neurons genuinely
+carry visual evidence, then deleting them should leave the language model ``blind
+but talkative'' --- it loses grounding in the image and hallucinates more. As a
+mirror-image control, the same experiment is run on TriviaQA, a purely textual
+general-knowledge quiz with no images at all. There, visual neurons should be
+irrelevant, and instead deleting \emph{text} neurons should be what hurts. This
+two-sided design is the heart of the experiment: visual damage should implicate
+visual neurons, textual damage should implicate text neurons, and getting both
+directions right is much harder to achieve by accident than either alone.
+
+\section*{Step one: building a trustworthy question set}
+
+Before measuring anything, the experiment cleans its measuring instrument. Models
+answer stochastically, so a question the model gets right one time and wrong the
+next would add noise to every measurement. Each candidate question is therefore
+asked ten times with sampling turned on, and only the questions where the model is
+\emph{consistent} --- always right or always wrong --- are kept. This is done across
+all three POPE difficulty variants and capped to roughly a thousand questions, and
+the same filtering is applied to TriviaQA to get about a thousand clean trivia
+questions. The result is a stable behavioral baseline: we know exactly how the
+intact model performs on every retained question.
+
+\section*{Step two: silencing neurons and measuring the damage}
+
+Now the slow part. The model's neurons are silenced in small groups --- fifty at a
+time --- by clamping their output to zero during the forward pass, while everything
+else in the model stays untouched. With one group silenced, the model re-answers the
+entire thousand-question POPE set, and its hallucination rate is compared to the
+intact baseline. The difference --- call it delta-H --- is the causal footprint of
+that group: a positive delta-H means those neurons were \emph{suppressing}
+hallucination, so removing them made things worse. The same silenced model also
+re-answers the thousand TriviaQA questions, producing a second score for textual
+damage. Then the hooks are removed, the next fifty neurons are silenced, and the
+whole evaluation repeats. Since each group's score requires two thousand fresh model
+generations, and a single layer contains hundreds of such groups, scoring one layer
+takes most of a day on one GPU --- which is why the cluster runs one job per layer
+and why this phase is where all the runs have been stuck. Each group's score is
+attributed equally to the fifty neurons inside it; that's an acknowledged
+approximation traded for tractability, since silencing neurons truly one at a time
+would be fifty times slower.
+
+\section*{Step three: the enrichment test itself}
+
+Once every layer is scored, all neurons in the model are ranked by their delta-H,
+and the top five percent are declared the ``hallucination-driving'' set --- the
+neurons whose removal most increased hallucination. Now comes the statistical
+question the experiment is named after: is any label category
+\emph{over-represented} in that driving set relative to its share of the whole
+model? Suppose visual neurons make up eight percent of all neurons but eighteen
+percent of the driving set --- that's enrichment. Formally, for each category a
+two-by-two table is built --- driving versus not driving, in the category versus not
+--- and Fisher's exact test gives two things: an odds ratio (how many times more
+likely a driving neuron is to carry that label than chance would predict, where
+above one means enriched and below one means depleted) and a p-value for whether the
+association could be a fluke. To calibrate everything, the same computation is also
+run a thousand times on \emph{randomly chosen} neuron sets of the same size; these
+random trials should show no enrichment, providing both a sanity check and bootstrap
+confidence intervals. The analysis is also repeated layer by layer, producing a map
+of where in the network's depth the enrichment concentrates.
+
+\section*{What success looks like}
+
+The hypothesis is a double dissociation. On the POPE side, the visual category
+should come out significantly enriched among hallucination-driving neurons ---
+deleting visual neurons blinds the model. On the TriviaQA side, the text category
+should be the enriched one --- deleting text neurons erases knowledge. Multimodal
+neurons may show up in both; unknown neurons and the random control should show
+nothing. And because the whole experiment is run twice over --- once with the
+permutation-test labels and once with the older fixed-threshold labels --- the paper
+can make the comparative claim that matters: the statistically principled labels
+predict causal function better than the heuristic ones. Every enrichment number
+planned for the camera-ready comes out of exactly this machinery.
+
+\end{document}

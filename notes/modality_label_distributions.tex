@@ -1,0 +1,88 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1.8cm]{geometry}
+\usepackage{parskip}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\newcommand{\up}{\,\textcolor{blue}{$\uparrow$}}
+\newcommand{\dn}{\,\textcolor{red}{$\downarrow$}}
+\title{Neuron Modality Labels \& Hallucination Enrichment\\[0.3em]
+\large PMBT, $p<0.001$, min-100/max-300 descriptions}
+\author{MH-Neuron / Modality Taxonomy}
+\date{June 13, 2026}
+\begin{document}
+\maketitle
+
+\section*{1. Modality-label distribution (PMBT $\cdot$ gate)}
+A neuron is \emph{unknown} if it has $<5$ high-activation tokens; otherwise
+\emph{visual}/\emph{text} if its visual-vs-text activation-rate difference is
+significant ($p<0.001$), else \emph{multimodal}.
+
+\begin{center}
+\begin{tabular}{l r r r r r}
+\toprule
+Model & Neurons & Visual & Text & Multimodal & Unknown \\
+\midrule
+LLaVA-1.5-7B & 352,256 & 111,893 (31.8\%) & 205,872 (58.4\%) & 34,456 (9.8\%) & 35 (0.0\%) \\
+LLaVA-OneVision-7B & 530,432 & 249,570 (47.1\%) & 180,289 (34.0\%) & 75,489 (14.2\%) & 25,084 (4.7\%) \\
+InternVL2.5-8B & 458,752 & 157,956 (34.4\%) & 214,604 (46.8\%) & 86,159 (18.8\%) & 33 (0.0\%) \\
+Qwen2.5-VL-3B & 396,288 & 173,234 (43.7\%) & 129,295 (32.6\%) & 41,396 (10.4\%) & 52,363 (13.2\%) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{2. Hallucination-driving enrichment by $\Delta H$ --- odds ratios}
+Driving neurons = top 5\% by $\Delta H$ (change in hallucination rate when the
+neuron is ablated); Fisher's exact test per category. OR $>1$ = enriched \up,
+OR $<1$ = depleted \dn; \textbf{bold} = significant ($p<0.05$) and $\ge$1.5 or
+$\le$0.67. POPE = visual hallucination; TriviaQA = text knowledge. The expected
+double dissociation: visual enriched on POPE / depleted on TQA, text the
+reverse. Only models/combos with results on disk are shown.
+
+\subsection*{POPE (visual hallucination)}
+\begin{center}
+\begin{tabular}{l l c c c c}
+\toprule
+Model & Combo & Visual & Text & Multimodal & Unknown \\
+\midrule
+LLaVA-1.5-7B & PMBT$\cdot$gate & 0.93\dn & 1.12\up & 0.87\dn & 0.00\dn \\
+LLaVA-1.5-7B & PMBT$\cdot$gate\_up & 1.04\up & 1.05\up & 0.80\dn & \textbf{0.25\dn} \\
+LLaVA-OneVision-7B & PMBT$\cdot$gate\_up & \textbf{0.36\dn} & \textbf{2.15\up} & \textbf{1.77\up} & \textbf{0.04\dn} \\
+InternVL2.5-8B & PMBT$\cdot$gate & \textbf{0.48\dn} & \textbf{1.81\up} & 0.98\dn & \textbf{22.82\up} \\
+InternVL2.5-8B & PMBT$\cdot$gate\_up & \textbf{2.11\up} & \textbf{0.62\dn} & 0.71\dn & \textbf{0.00\dn} \\
+InternVL2.5-8B & FT$\cdot$gate & \textbf{0.62\dn} & 0.87\dn & 1.40\up & \textbf{2.07\up} \\
+Qwen2.5-VL-3B & PMBT$\cdot$gate & \textbf{2.02\up} & 0.81\dn & 1.04\up & \textbf{0.03\dn} \\
+Qwen2.5-VL-3B & PMBT$\cdot$gate\_up & 1.38\up & 0.91\dn & 0.93\dn & \textbf{0.02\dn} \\
+Qwen2.5-VL-3B & FT$\cdot$gate & 1.18\up & 0.78\dn & 0.93\dn & 1.06\up \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection*{TriviaQA (text knowledge)}
+\begin{center}
+\begin{tabular}{l l c c c c}
+\toprule
+Model & Combo & Visual & Text & Multimodal & Unknown \\
+\midrule
+LLaVA-OneVision-7B & PMBT$\cdot$gate\_up & 0.94\dn & 1.01\up & 1.15\up & \textbf{0.62\dn} \\
+InternVL2.5-8B & PMBT$\cdot$gate & \textbf{1.52\up} & 0.74\dn & 0.83\dn & 0.00\dn \\
+InternVL2.5-8B & PMBT$\cdot$gate\_up & 1.46\up & 0.82\dn & 0.82\dn & \textbf{0.21\dn} \\
+InternVL2.5-8B & FT$\cdot$gate & 1.29\up & 0.69\dn & 1.02\up & \textbf{0.27\dn} \\
+Qwen2.5-VL-3B & PMBT$\cdot$gate & 0.88\dn & 1.21\up & 0.85\dn & 1.03\up \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent\textbf{Coverage / caveats.} LLaVA-OneVision-7B and LLaVA-1.5-7B
+currently have \emph{gate\_up only} --- their gate and FT step-10 jobs are still
+running; LLaVA-1.5 is the validation model and runs POPE only (no TriviaQA).
+Qwen2.5-VL-3B TQA is gate-only so far. Per-neuron $\Delta H$ is
+quantised (batch-of-50 ablation), so the top-5\% cutoff often lands on a tie at
+the boundary --- treat marginal ORs cautiously --- but the $\Delta H$ ranking is
+the paper's headline and reproduces the visual/text double dissociation. Labels
+from \texttt{llm\_permutation\_min100\_max2048/} (native $\alpha=0.001$ on
+max-300 text for these models).
+
+\end{document}
