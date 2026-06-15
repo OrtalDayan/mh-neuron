@@ -1,0 +1,22 @@
+# Apply with: patch -p0 < notes/patches/modeling_internlm2_past_key_values.patch
+# Target: ~/.cache/huggingface/.../OpenGVLab/InternVL2_5_hyphen_8B/<rev>/modeling_internlm2.py
+# Guards InternLM2's prepare_inputs_for_generation against newer transformers
+# passing past_key_values as a Cache object or as a tuple containing None
+# entries during the first decoding step. Without this, evaluation crashes
+# with `'NoneType' object has no attribute 'shape'`.
+
+--- modeling_internlm2.py
++++ modeling_internlm2.py
+@@ Around line 1115 @@
+         if past_key_values is not None:
+-            past_length = past_key_values[0][0].shape[2]
++            # In newer transformers past_key_values may be a Cache object or
++            # a tuple containing None entries during the first decoding step.
++            # Guard against either shape by attempting the indexed tuple access
++            # and falling back to "no past" semantics.
++            try:
++                past_length = past_key_values[0][0].shape[2]
++            except (TypeError, AttributeError, IndexError):
++                past_length = 0
++                past_key_values = None
++        if past_key_values is not None:

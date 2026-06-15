@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /home/projects/bagon/ortalda/myrepo-weight_merging log --all --oneline -- modality_taxonomy/CLAUDE.md)",
+      "Bash(git -C /home/projects/bagon/ortalda/myrepo-weight_merging log --all --oneline -- CLAUDE.md)",
+      "Bash(git *)"
+    ]
+  }
+}

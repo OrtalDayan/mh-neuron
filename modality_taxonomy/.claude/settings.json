@@ -1,0 +1,48 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Edit",
+      "Bash(uv run:*)",
+      "Bash(uv sync)",
+      "Bash(bash code/run_pipeline.sh:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(grep:*)",
+      "Bash(bjobs:*)",
+      "Bash(bpeek:*)",
+      "Bash(bhist:*)",
+      "Bash(bqueues:*)",
+      "Bash(bhosts:*)",
+      "Bash(bsub:*)",
+      "Bash(find:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(wc:*)",
+      "Bash(echo:*)",
+      "Bash(mkdir:*)",
+      "Bash(cp:*)",
+      "Bash(mv:*)",
+      "Bash(sed:*)",
+      "Bash(awk:*)",
+      "Bash(sort:*)",
+      "Bash(uniq:*)"
+    ],
+    "ask": [
+      "Bash(bkill:*)",
+      "Bash(git push:*)",
+      "Bash(git reset:*)",
+      "Bash(git checkout:*)",
+      "Bash(git clean:*)",
+      "Bash(rm:*)",
+      "Bash(bash code/run_pipeline.sh * --wipe)",
+      "Bash(bash code/run_pipeline.sh * --clean:*)"
+    ]
+  }
+}
