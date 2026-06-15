@@ -1,0 +1,31 @@
+# Results & data
+results/
+results_copy/
+results copy/
+data/
+
+# Logs
+logs/
+
+# Model weights
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Virtual environments
+.venv/
+modern_vlms/.venv/
+modern_vlms/pretrained/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Backup copies
+code_copy/
+
+# OS / tools
+.DS_Store
+uv.lock
