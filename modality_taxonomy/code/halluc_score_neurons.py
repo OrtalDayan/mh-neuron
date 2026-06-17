@@ -1919,7 +1919,7 @@ def ablation_worker(gpu_id, layer_range, args, return_dict):
     # Load TriviaQA contrastive set when --halluc_triviaqa is set
     tqa_questions   = None                                                 # Line 20a: TriviaQA questions (None = disabled)
     baseline_tqa_er = None                                                 # Line 20b: baseline TriviaQA error rate
-    if getattr(args, 'halluc_triviaqa', False):                            # Line 20c: check flag safely
+    if getattr(args, 'halluc_triviaqa', False) and args.model_type != 'llava-hf':  # Line 20c: check flag (llava-1.5 has no text-only forward → excluded)
         tqa_contrastive_path = os.path.join(                               # Line 20d: path written by build_contrastive_triviaqa_set
             args.output_dir, 'contrastive_triviaqa.jsonl')
         if os.path.isfile(tqa_contrastive_path):                           # Line 20e: file exists — load it
@@ -2574,7 +2574,7 @@ def main():
             print(f'  CETT-diff scores available ({len(cett_diff_scores)} neurons)')
 
     # ── TriviaQA contrastive preprocessing (Section 3.5) ────────────
-    if getattr(args, 'halluc_triviaqa', False):                            # Line 5c: build TriviaQA contrastive set
+    if getattr(args, 'halluc_triviaqa', False) and args.model_type != 'llava-hf':  # Line 5c: build TriviaQA set (llava-1.5 excluded — no text-only forward)
         _, n_tqa_clean, cett_diff_scores_tqa = build_contrastive_triviaqa_set(args)
         print(f'  TriviaQA contrastive set ready: {n_tqa_clean} questions')
 

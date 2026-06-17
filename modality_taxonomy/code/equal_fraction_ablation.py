@@ -1587,10 +1587,14 @@ def run_phase1(args):
                                        bdata, device, mcq_suffix=mcq_suffix)
                 results[bname] = r
             elif btype == 'triviaqa':
-                r = evaluate_triviaqa(model, args.model_type, processor,
-                                      image_processor, image_token_id,
-                                      bdata, device, text_only=True)
-                results[bname] = r
+                # llava-1.5 ('hf'/'liuhaotian') has no text-only forward → excluded.
+                if args.model_type in ('hf', 'llava-hf', 'liuhaotian', 'llava-liuhaotian'):
+                    print(f"  [skip] TriviaQA for {args.model_type} (llava-1.5 has no text-only forward)")
+                else:
+                    r = evaluate_triviaqa(model, args.model_type, processor,
+                                          image_processor, image_token_id,
+                                          bdata, device, text_only=True)
+                    results[bname] = r
         return results
 
     # ── Build neuron map helper ──
