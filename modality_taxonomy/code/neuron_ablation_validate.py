@@ -1673,6 +1673,91 @@ def generate_answer(model, model_type, tokenizer_or_processor, image_processor,
     return answer.strip()
 
 
+# Model types that are llava-1.5 (HF wrapper or original liuhaotian repo).
+# These have NO working text-only forward — they require an <image> placeholder
+# and a pixel_values tensor — so they are excluded from the text-only
+# benchmarks (TriviaQA, MMLU) rather than fed a blank dummy image.
+BENCHMARK_EXCLUDED_MODELS = {'hf', 'llava-hf', 'liuhaotian', 'llava-liuhaotian'}
+
+
+def generate_answer_text_only(model, model_type, tokenizer_or_processor,
+                              question, device, max_new_tokens=512):
+    """Generate a text answer with NO image input (true text-only forward).
+
+    Mirrors generate_answer() per backend but omits the image entirely — no
+    real image, not even a blank dummy — so the visual pathway receives no
+    input on text-only benchmarks (TriviaQA, MMLU).  llava-1.5 ('hf' /
+    'liuhaotian') has no text-only path and is excluded by the callers
+    (see BENCHMARK_EXCLUDED_MODELS).
+
+    Args/Returns: as generate_answer(), minus the image arguments.
+    """
+    with torch.no_grad():
+        if model_type in ('llava-llama3', 'llava-mistral'):
+            messages = [{"role": "user", "content": [                          # text-only message: no {"type": "image"}
+                {"type": "text", "text": question},
+            ]}]
+            prompt_text = tokenizer_or_processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer_or_processor(
+                text=prompt_text, return_tensors='pt').to(device)             # no images= argument
+            output_ids = model.generate(
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            prompt_len = inputs['input_ids'].shape[1]
+            answer = tokenizer_or_processor.decode(
+                output_ids[0][prompt_len:], skip_special_tokens=True)
+
+        elif model_type == 'internvl':
+            # model.chat accepts pixel_values=None for a pure text-only turn.
+            generation_config = dict(max_new_tokens=max_new_tokens, do_sample=False)
+            answer = model.chat(
+                tokenizer_or_processor, None, question, generation_config)    # pixel_values=None
+
+        elif model_type == 'llava-ov':
+            messages = [{"role": "user", "content": [
+                {"type": "text", "text": question},
+            ]}]
+            prompt_text = tokenizer_or_processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer_or_processor(
+                text=prompt_text, return_tensors='pt').to(device)
+            output_ids = model.generate(
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            prompt_len = inputs['input_ids'].shape[1]
+            answer = tokenizer_or_processor.decode(
+                output_ids[0][prompt_len:], skip_special_tokens=True)
+
+        elif model_type == 'idefics2':
+            messages = [{"role": "user", "content": [
+                {"type": "text", "text": question},
+            ]}]
+            prompt_text = tokenizer_or_processor.apply_chat_template(
+                messages, add_generation_prompt=True)
+            inputs = tokenizer_or_processor(
+                text=prompt_text, return_tensors='pt').to(device)            # no images= argument
+            output_ids = model.generate(
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            prompt_len = inputs['input_ids'].shape[1]
+            answer = tokenizer_or_processor.decode(
+                output_ids[0][prompt_len:], skip_special_tokens=True)
+
+        else:  # qwen2vl
+            messages = [{"role": "user", "content": [
+                {"type": "text", "text": question},
+            ]}]
+            prompt_text = tokenizer_or_processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer_or_processor(
+                text=[prompt_text], padding=True, return_tensors='pt').to(device)  # no images/videos
+            output_ids = model.generate(
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            prompt_len = inputs['input_ids'].shape[1]
+            answer = tokenizer_or_processor.decode(
+                output_ids[0][prompt_len:], skip_special_tokens=True)
+
+    return answer.strip()
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Section 6b — VQAv2 evaluation (+ perception/knowledge split)
 # ═══════════════════════════════════════════════════════════════════
@@ -1825,7 +1910,7 @@ def load_triviaqa(path, num_questions=None, seed=42):
 
 def evaluate_triviaqa(model, model_type, tokenizer_or_processor, image_processor,
                       image_token_id, items, device):
-    """Run TriviaQA evaluation using a VLM with a dummy blank image.
+    """Run TriviaQA evaluation text-only (NO image fed to the VLM).
 
     For each question, checks if the model's free-form response
     contains any of the accepted answer aliases (case-insensitive
@@ -1841,10 +1926,9 @@ def evaluate_triviaqa(model, model_type, tokenizer_or_processor, image_processor
         prompt = (f"Answer the following question briefly.\n"                   # prompt template
                   f"Question: {item['question']}\nAnswer:")
 
-        answer = generate_answer(                                               # generate with dummy image
+        answer = generate_answer_text_only(                                     # text-only: NO image fed
             model, model_type, tokenizer_or_processor,
-            image_processor, image_token_id,
-            DUMMY_IMAGE, prompt, device, max_new_tokens=30)
+            prompt, device, max_new_tokens=30)
 
         answer_lower = answer.strip().lower()                                  # normalise prediction
         if any(alias in answer_lower for alias in item['aliases']):            # substring match against aliases
@@ -1912,7 +1996,7 @@ def load_mmlu(mmlu_dir, num_questions=None, seed=42):
 
 def evaluate_mmlu(model, model_type, tokenizer_or_processor, image_processor,
                   image_token_id, items, device):
-    """Run MMLU evaluation using a VLM with a dummy blank image.
+    """Run MMLU evaluation text-only (NO image fed to the VLM).
 
     Formats each question as a multiple-choice prompt (A/B/C/D) and
     checks whether the model's first-token response matches the
@@ -1935,10 +2019,9 @@ def evaluate_mmlu(model, model_type, tokenizer_or_processor, image_processor,
                   f"D. {choices['D']}\n"
                   f"Answer:")
 
-        answer = generate_answer(                                               # generate with dummy image
+        answer = generate_answer_text_only(                                     # text-only: NO image fed
             model, model_type, tokenizer_or_processor,
-            image_processor, image_token_id,
-            DUMMY_IMAGE, prompt, device, max_new_tokens=5)
+            prompt, device, max_new_tokens=5)
 
         # Parse the predicted letter from the model's response
         pred_letter = answer.strip().upper()                                   # e.g. "B" or "B. Paris"
@@ -2722,8 +2805,11 @@ def main():
             result['vqa_knowledge'] = vqa_know_result                  # Line V7: store under split key
             print(f'  VQA-Knowledge: accuracy={vqa_know_result["accuracy"]:.4f}')
 
-        # TriviaQA evaluation (text-only, uses dummy blank image)
-        if triviaqa_items:
+        # TriviaQA evaluation (text-only, NO image). llava-1.5 has no text-only
+        # forward, so it is excluded from this benchmark.
+        if triviaqa_items and args.model_type in BENCHMARK_EXCLUDED_MODELS:
+            print(f'\n  TriviaQA: SKIPPED for {args.model_type} (llava-1.5 has no text-only forward)')
+        elif triviaqa_items:
             print(f'\n  Running TriviaQA evaluation ({len(triviaqa_items)} questions) ...')
             triviaqa_result = evaluate_triviaqa(
                 model, args.model_type, tokenizer_or_processor,
@@ -2732,8 +2818,10 @@ def main():
             result['triviaqa'] = triviaqa_result
             print(f'  TriviaQA: accuracy={triviaqa_result["accuracy"]:.4f}')
 
-        # MMLU evaluation (text-only, uses dummy blank image)
-        if mmlu_items:
+        # MMLU evaluation (text-only, NO image). llava-1.5 excluded (see above).
+        if mmlu_items and args.model_type in BENCHMARK_EXCLUDED_MODELS:
+            print(f'\n  MMLU: SKIPPED for {args.model_type} (llava-1.5 has no text-only forward)')
+        elif mmlu_items:
             print(f'\n  Running MMLU evaluation ({len(mmlu_items)} questions) ...')
             mmlu_result = evaluate_mmlu(
                 model, args.model_type, tokenizer_or_processor,

@@ -3120,7 +3120,7 @@ if [[ "$HALLUC_CONTRASTIVE" == "1" ]]; then
     HS_COMMON_ARGS="$HS_COMMON_ARGS --contrastive"
     [[ "$MODE" == "test" ]] && HS_COMMON_ARGS="$HS_COMMON_ARGS --contrastive_start_per_split 5 --contrastive_samples 2 --contrastive_cap_per_split 3"
 fi
-if [[ "$HALLUC_TRIVIAQA" == "1" ]]; then
+if [[ "$HALLUC_TRIVIAQA" == "1" && "$MODEL_TYPE" != "llava-hf" ]]; then   # llava-1.5 has no text-only forward → excluded from TriviaQA
     HS_COMMON_ARGS="$HS_COMMON_ARGS --halluc_triviaqa --triviaqa_path $TRIVIAQA_PATH --triviaqa_num $TRIVIAQA_NUM"
     [[ "$MODE" == "test" ]] && HS_COMMON_ARGS="$HS_COMMON_ARGS --triviaqa_cap 10"
 fi
@@ -3190,7 +3190,7 @@ else
     # the Phase-2 enrichment reuse them instead of re-sampling on GPU (~1.5h).
     # Fast path no-ops to a full rebuild if the files are somehow absent.
     [[ "$HALLUC_CONTRASTIVE" == "1" ]] && HS_ENR_ARGS="$HS_ENR_ARGS --skip_contrastive_prep"
-    [[ "$HALLUC_TRIVIAQA" == "1" ]] && HS_ENR_ARGS="$HS_ENR_ARGS --halluc_triviaqa --triviaqa_path $TRIVIAQA_PATH --triviaqa_num $TRIVIAQA_NUM"
+    [[ "$HALLUC_TRIVIAQA" == "1" && "$MODEL_TYPE" != "llava-hf" ]] && HS_ENR_ARGS="$HS_ENR_ARGS --halluc_triviaqa --triviaqa_path $TRIVIAQA_PATH --triviaqa_num $TRIVIAQA_NUM"
     rm -f "$WORK_DIR/$STEP_LOG_DIR/${HS_AGG_JOB}${LOG_SUFFIX}.log" \
           "$WORK_DIR/$STEP_LOG_DIR/${HS_AGG_JOB}${LOG_SUFFIX}.err"
     bsub -q "$QUEUE" -J "$HS_AGG_JOB" "${AGG_DEP[@]}" "${AGG_GPU[@]}" \
@@ -7531,10 +7531,10 @@ if [[ -n "$CHAIR_ANN_PATH" ]] && (( ST_CHAIR_NUM > 0 )); then
     ST_BASE_ARGS="$ST_BASE_ARGS --chair_ann_path $CHAIR_ANN_PATH --chair_num_images $ST_CHAIR_NUM"
     [[ -n "$POPE_IMG_DIR" ]] && ST_BASE_ARGS="$ST_BASE_ARGS --chair_img_dir $POPE_IMG_DIR"
 fi
-if [[ -n "$TRIVIAQA_PATH" ]] && [[ "$MODEL_TYPE" != "llava-mistral" && "$MODEL_TYPE" != "llava-llama3" ]]; then
+if [[ -n "$TRIVIAQA_PATH" ]] && [[ "$MODEL_TYPE" != "llava-mistral" && "$MODEL_TYPE" != "llava-llama3" && "$MODEL_TYPE" != "llava-hf" ]]; then
     ST_BASE_ARGS="$ST_BASE_ARGS --triviaqa_path $TRIVIAQA_PATH --triviaqa_num_questions $TRIVIAQA_NUM"
 fi
-if [[ -n "$MMLU_DIR" ]] && [[ "$MODEL_TYPE" != "llava-mistral" && "$MODEL_TYPE" != "llava-llama3" ]]; then
+if [[ -n "$MMLU_DIR" ]] && [[ "$MODEL_TYPE" != "llava-mistral" && "$MODEL_TYPE" != "llava-llama3" && "$MODEL_TYPE" != "llava-hf" ]]; then
     ST_BASE_ARGS="$ST_BASE_ARGS --mmlu_dir $MMLU_DIR --mmlu_num_questions $MMLU_NUM"
 fi
 if [[ -d "$VSR_PATH" ]]; then
